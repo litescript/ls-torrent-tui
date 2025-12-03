@@ -213,6 +213,15 @@ The project uses GitHub Actions for continuous integration. On every push and pu
 - Tests (`go test`)
 - Build verification (`go build`)
 
+## Roadmap
+
+**v0.1.0** (current): Basic TUI + qBittorrent control
+
+**Next**:
+- Search provider UX improvements
+- Native VPN integration
+- Plex organize pipeline
+
 ## License
 
 Licensed under the MIT License — see [LICENSE](LICENSE) for details.

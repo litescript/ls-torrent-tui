@@ -15,12 +15,12 @@ type MovieNaming struct {
 
 // TVNaming contains parsed TV show information for file naming.
 type TVNaming struct {
-	ShowTitle  string
-	Season     int
-	Episode    int
+	ShowTitle    string
+	Season       int
+	Episode      int
 	EpisodeTitle string // Optional episode title
-	Resolution string
-	Extension  string
+	Resolution   string
+	Extension    string
 }
 
 // FormatMoviePath generates a Plex-compatible path for a movie.

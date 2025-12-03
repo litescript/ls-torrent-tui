@@ -31,10 +31,10 @@ var ErrDetectionFailed = errors.New("unable to detect media type")
 // DetectionResult holds the outcome of media type detection.
 type DetectionResult struct {
 	Type       MediaType
-	Title      string // Parsed title
-	Year       int    // Release year (movies) or 0 if unknown
-	Season     int    // Season number (TV) or 0
-	Episode    int    // Episode number (TV) or 0
+	Title      string  // Parsed title
+	Year       int     // Release year (movies) or 0 if unknown
+	Season     int     // Season number (TV) or 0
+	Episode    int     // Episode number (TV) or 0
 	Confidence float64 // 0.0-1.0 confidence score
 }
 

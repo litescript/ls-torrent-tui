@@ -1,4 +1,4 @@
-.PHONY: build run test clean install dev
+.PHONY: build run test clean install dev fmt vet lint deps
 
 BINARY_NAME=torrent-tui
 BUILD_DIR=./build
@@ -21,6 +21,20 @@ dev:
 # Run tests
 test:
 	go test -v ./...
+
+# Format code
+fmt:
+	gofmt -w .
+
+# Run go vet
+vet:
+	go vet ./...
+
+# Lint: vet + format check
+lint: vet
+	@echo "Checking formatting..."
+	@test -z "$$(gofmt -l .)" || (echo "Files need formatting:"; gofmt -l .; exit 1)
+	@echo "Lint passed"
 
 # Clean build artifacts
 clean:

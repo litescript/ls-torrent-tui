@@ -1,0 +1,1735 @@
+// Package tui implements the terminal user interface using Bubble Tea.
+// It handles all user interaction, display rendering, and coordinates
+// between the various backend services (scrapers, qBittorrent, VPN).
+package tui
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/litescript/ls-torrent-tui/internal/config"
+	"github.com/litescript/ls-torrent-tui/internal/qbit"
+	"github.com/litescript/ls-torrent-tui/internal/scraper"
+	"github.com/litescript/ls-torrent-tui/internal/theme"
+	"github.com/litescript/ls-torrent-tui/internal/vpn"
+)
+
+// View modes
+type viewMode int
+
+const (
+	viewSearch viewMode = iota
+	viewResults
+	viewDetails
+	viewVPNConnect // Shown when VPN is disconnected
+)
+
+// Tabs
+type tabType int
+
+const (
+	tabSearch tabType = iota
+	tabDownloads
+	tabCompleted
+	tabSources
+)
+
+// SearchSource represents a configured torrent search site
+type SearchSource struct {
+	Name    string
+	URL     string
+	Enabled bool
+	Scraper scraper.Scraper
+	Builtin bool // true for built-in sources, false for user-added
+}
+
+// Model is the main application state
+type Model struct {
+	// Config
+	cfg config.Config
+
+	// Components
+	searchInput textinput.Model
+	spinner     spinner.Model
+
+	// State
+	mode          viewMode
+	activeTab     tabType
+	results       []scraper.Torrent
+	cursor        int
+	dlCursor      int // cursor for downloads tab
+	searching     bool
+	err           error
+	statusMsg     string
+	vpnStatus     vpn.Status
+	vpnChecked    bool // Have we done initial VPN check?
+	vpnConnecting bool // Are we currently connecting to VPN?
+	qbitOnline    bool
+
+	// Torrent lists from qBittorrent
+	downloading []qbit.TorrentInfo
+	completed   []qbit.TorrentInfo
+
+	// Sorting (downloads/completed tabs)
+	sortCol int  // 0=name, 1=size, 2=done, 3=dl, 4=ul, 5=eta
+	sortAsc bool // true=ascending, false=descending
+
+	// Search sources
+	sources       []SearchSource
+	srcCursor     int
+	addingURL     bool // Are we adding a URL?
+	validatingURL bool // Are we validating a URL?
+	urlInput      textinput.Model
+
+	// Dimensions
+	width  int
+	height int
+
+	// Services
+	qbitClient *qbit.Client
+	vpnChecker *vpn.Checker
+}
+
+// Messages
+type searchResultMsg struct {
+	results []scraper.Torrent
+	err     error
+}
+
+type vpnStatusMsg struct {
+	status vpn.Status
+}
+
+type qbitStatusMsg struct {
+	online bool
+}
+
+type filesLoadedMsg struct {
+	index int
+	err   error
+}
+
+type torrentAddedMsg struct {
+	name string
+	err  error
+}
+
+type vpnConnectMsg struct {
+	err error
+}
+
+type urlValidateMsg struct {
+	url     string
+	name    string
+	scraper scraper.Scraper
+	err     error
+}
+
+type torrentListMsg struct {
+	downloading []qbit.TorrentInfo
+	completed   []qbit.TorrentInfo
+	err         error
+}
+
+type tickMsg time.Time
+
+type torrentActionMsg struct {
+	action string
+	name   string
+	err    error
+}
+
+type plexMoveMsg struct {
+	name string
+	err  error
+}
+
+// NewModel creates the initial model
+func NewModel(cfg config.Config) Model {
+	ti := textinput.New()
+	ti.Placeholder = "Search torrents..."
+	ti.Focus()
+	ti.CharLimit = 256
+	ti.Width = 50
+
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color(theme.CurrentPalette.Accent))
+
+	// URL input for adding sources
+	urlIn := textinput.New()
+	urlIn.Placeholder = "Paste torrent site URL..."
+	urlIn.CharLimit = 512
+	urlIn.Width = 60
+
+	// Initialize search sources from config
+	// No built-in sources - users add their own via the Sources tab
+	var sources []SearchSource
+	for _, src := range cfg.Sources {
+		sources = append(sources, SearchSource{
+			Name:    src.Name,
+			URL:     src.URL,
+			Enabled: src.Enabled,
+			Scraper: scraper.NewGenericScraper(src.Name, src.URL),
+			Builtin: false,
+		})
+	}
+
+	qbitClient := qbit.NewClient(
+		cfg.QBittorrent.Host,
+		cfg.QBittorrent.Port,
+		cfg.QBittorrent.Username,
+		cfg.QBittorrent.Password,
+	)
+
+	vpnChecker := vpn.NewChecker(cfg.VPN.StatusScript, cfg.VPN.ConnectScript)
+
+	return Model{
+		cfg:         cfg,
+		searchInput: ti,
+		spinner:     sp,
+		urlInput:    urlIn,
+		mode:        viewSearch,
+		sources:     sources,
+		qbitClient:  qbitClient,
+		vpnChecker:  vpnChecker,
+	}
+}
+
+// Init initializes the model
+func (m Model) Init() tea.Cmd {
+	return tea.Batch(
+		textinput.Blink,
+		m.checkVPNStatus(),
+		m.checkQbitStatus(),
+		m.fetchTorrents(),
+		tickCmd(),
+	)
+}
+
+// tickCmd returns a command that ticks every 2 seconds
+func tickCmd() tea.Cmd {
+	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+		return tickMsg(t)
+	})
+}
+
+// Update handles messages
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmds []tea.Cmd
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		newModel, cmd := m.handleKeyPress(msg)
+		if cmd != nil {
+			// Key was handled, return with command
+			return newModel, cmd
+		}
+		// Key wasn't fully handled, continue to text input
+		m = newModel.(Model)
+
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.searchInput.Width = msg.Width - 20
+
+	case spinner.TickMsg:
+		if m.searching || m.vpnConnecting {
+			var cmd tea.Cmd
+			m.spinner, cmd = m.spinner.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+
+	case searchResultMsg:
+		m.searching = false
+		if msg.err != nil {
+			m.err = msg.err
+			m.statusMsg = fmt.Sprintf("Search failed: %v", msg.err)
+		} else if len(msg.results) == 0 {
+			m.statusMsg = "No results found"
+			m.results = nil
+		} else {
+			m.results = msg.results
+			m.cursor = 0
+			m.mode = viewResults
+			m.statusMsg = fmt.Sprintf("Found %d results", len(m.results))
+		}
+
+	case vpnStatusMsg:
+		m.vpnStatus = msg.status
+		wasChecked := m.vpnChecked
+		m.vpnChecked = true
+
+		// On initial check, if VPN is disconnected, show connect prompt
+		if !wasChecked && !m.vpnStatus.Connected {
+			m.mode = viewVPNConnect
+			m.statusMsg = "VPN required - press Enter to connect or q to quit"
+			m.searchInput.Blur() // Unfocus so keys work
+		} else if wasChecked {
+			// Manual refresh - show status
+			if m.vpnStatus.Connected {
+				m.statusMsg = "VPN: " + m.vpnStatus.StatusString()
+			} else {
+				m.statusMsg = "VPN: Disconnected!"
+			}
+		}
+
+		// If we were in VPN connect mode and now connected, go to search
+		if m.mode == viewVPNConnect && m.vpnStatus.Connected {
+			m.mode = viewSearch
+			m.statusMsg = "VPN connected!"
+			m.searchInput.Focus()
+		}
+
+	case qbitStatusMsg:
+		m.qbitOnline = msg.online
+
+	case filesLoadedMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Error loading files: %v", msg.err)
+		}
+
+	case torrentAddedMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Error: %v", msg.err)
+		} else {
+			m.statusMsg = fmt.Sprintf("Added: %s", TruncateString(msg.name, 40))
+		}
+
+	case vpnConnectMsg:
+		m.vpnConnecting = false
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("VPN connection failed: %v", msg.err)
+		} else {
+			m.statusMsg = "VPN connecting... checking status"
+			// Re-check VPN status after connect attempt
+			cmds = append(cmds, m.checkVPNStatus())
+		}
+
+	case urlValidateMsg:
+		m.validatingURL = false
+		m.addingURL = false
+		m.urlInput.Blur()
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Invalid source: %v", msg.err)
+		} else {
+			m.sources = append(m.sources, SearchSource{
+				Name:    msg.name,
+				URL:     msg.url,
+				Enabled: true,
+				Scraper: msg.scraper,
+				Builtin: false,
+			})
+			m.saveSources()
+			m.statusMsg = fmt.Sprintf("Added source: %s", msg.name)
+		}
+
+	case torrentListMsg:
+		if msg.err == nil {
+			m.downloading = msg.downloading
+			m.completed = msg.completed
+		}
+
+	case tickMsg:
+		// Periodic refresh - fetch torrents and schedule next tick
+		cmds = append(cmds, m.fetchTorrents(), tickCmd())
+
+	case torrentActionMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("%s failed: %v", msg.action, msg.err)
+		} else {
+			m.statusMsg = fmt.Sprintf("%s: %s", msg.action, TruncateString(msg.name, 30))
+		}
+		// Refresh torrent list after action
+		cmds = append(cmds, m.fetchTorrents())
+
+	case plexMoveMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Plex move failed: %v", msg.err)
+		} else {
+			m.statusMsg = fmt.Sprintf("Moved to Plex: %s", TruncateString(msg.name, 30))
+		}
+	}
+
+	// Update text inputs (only when not in VPN connect mode)
+	if m.mode != viewVPNConnect {
+		if m.addingURL {
+			var cmd tea.Cmd
+			m.urlInput, cmd = m.urlInput.Update(msg)
+			cmds = append(cmds, cmd)
+		} else {
+			var cmd tea.Cmd
+			m.searchInput, cmd = m.searchInput.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+	}
+
+	return m, tea.Batch(cmds...)
+}
+
+// handled returns a no-op command to signal the key was handled
+func handled() tea.Cmd {
+	return func() tea.Msg { return nil }
+}
+
+func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+
+	// Handle VPN connect mode specially
+	if m.mode == viewVPNConnect {
+		switch key {
+		case "ctrl+c", "q":
+			return m, tea.Quit
+		case "enter", "V":
+			if !m.vpnConnecting {
+				m.vpnConnecting = true
+				m.statusMsg = "Connecting to VPN..."
+				return m, tea.Batch(m.spinner.Tick, m.connectVPN())
+			}
+		}
+		return m, handled()
+	}
+
+	// When adding URL in sources tab
+	if m.addingURL && m.urlInput.Focused() {
+		switch key {
+		case "ctrl+c", "esc":
+			m.addingURL = false
+			m.validatingURL = false
+			m.urlInput.Blur()
+			return m, handled()
+		case "alt+1":
+			m.addingURL = false
+			m.urlInput.Blur()
+			m.activeTab = tabSearch
+			m.mode = viewSearch
+			return m, handled()
+		case "alt+2":
+			m.addingURL = false
+			m.urlInput.Blur()
+			m.activeTab = tabDownloads
+			m.dlCursor = 0
+			return m, handled()
+		case "alt+3":
+			m.addingURL = false
+			m.urlInput.Blur()
+			m.activeTab = tabCompleted
+			m.dlCursor = 0
+			return m, handled()
+		case "alt+4":
+			m.addingURL = false
+			m.urlInput.Blur()
+			m.activeTab = tabSources
+			m.srcCursor = 0
+			return m, handled()
+		case "enter":
+			if m.validatingURL {
+				return m, handled() // Already validating
+			}
+			rawURL := strings.TrimSpace(m.urlInput.Value())
+			if rawURL != "" {
+				m.validatingURL = true
+				m.statusMsg = "Validating URL..."
+				return m, tea.Batch(m.spinner.Tick, m.validateURL(rawURL))
+			}
+			m.addingURL = false
+			m.urlInput.Blur()
+			return m, handled()
+		}
+		// All other keys go to URL input
+		return m, nil
+	}
+
+	// When search input is focused (INPUT MODE), only handle specific keys
+	// Let everything else go to the text input
+	if m.searchInput.Focused() {
+		switch key {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "alt+1":
+			m.activeTab = tabSearch
+			m.mode = viewSearch
+			m.addingURL = false
+			return m, handled()
+		case "alt+2":
+			m.searchInput.Blur()
+			m.activeTab = tabDownloads
+			m.dlCursor = 0
+			m.addingURL = false
+			return m, handled()
+		case "alt+3":
+			m.searchInput.Blur()
+			m.activeTab = tabCompleted
+			m.dlCursor = 0
+			m.addingURL = false
+			return m, handled()
+		case "alt+4":
+			m.searchInput.Blur()
+			m.activeTab = tabSources
+			m.srcCursor = 0
+			m.addingURL = false
+			return m, handled()
+		case "esc":
+			m.searchInput.Blur()
+			return m, handled()
+		case "enter":
+			if m.searchInput.Value() != "" {
+				if !m.vpnStatus.Connected {
+					m.statusMsg = "VPN required! Press V to connect"
+					return m, handled()
+				}
+				m.searching = true
+				m.err = nil
+				m.statusMsg = "Searching..."
+				m.searchInput.Blur()
+				return m, tea.Batch(m.spinner.Tick, m.doSearch())
+			}
+			return m, handled()
+		}
+		// All other keys go to text input
+		return m, nil
+	}
+
+	// Tab switching (works in any mode when not typing)
+	switch key {
+	case "1", "alt+1":
+		m.activeTab = tabSearch
+		m.mode = viewSearch
+		m.addingURL = false
+		return m, handled()
+	case "2", "alt+2":
+		m.activeTab = tabDownloads
+		m.dlCursor = 0
+		m.addingURL = false
+		return m, handled()
+	case "3", "alt+3":
+		m.activeTab = tabCompleted
+		m.dlCursor = 0
+		m.addingURL = false
+		return m, handled()
+	case "4", "alt+4":
+		m.activeTab = tabSources
+		m.srcCursor = 0
+		m.addingURL = false
+		return m, handled()
+	}
+
+	// Search input NOT focused (CMD MODE) - handle navigation keys
+	switch key {
+	case "ctrl+c", "q":
+		if m.activeTab == tabSearch && m.mode == viewSearch {
+			return m, tea.Quit
+		}
+		m.activeTab = tabSearch
+		m.mode = viewSearch
+		return m, handled()
+
+	case "esc":
+		m.mode = viewSearch
+		return m, handled()
+
+	case "enter":
+		// Context-dependent enter action
+		if m.activeTab == tabSources && len(m.sources) > 0 && m.srcCursor < len(m.sources) {
+			m.sources[m.srcCursor].Enabled = !m.sources[m.srcCursor].Enabled
+			if m.sources[m.srcCursor].Enabled {
+				m.statusMsg = fmt.Sprintf("Enabled: %s", m.sources[m.srcCursor].Name)
+			} else {
+				m.statusMsg = fmt.Sprintf("Disabled: %s", m.sources[m.srcCursor].Name)
+			}
+			m.saveSources()
+			return m, handled()
+		}
+		if m.mode == viewResults && len(m.results) > 0 {
+			return m, m.loadFiles()
+		}
+		return m, handled()
+
+	case "up", "k":
+		switch m.activeTab {
+		case tabSearch:
+			if m.mode == viewResults && m.cursor > 0 {
+				m.cursor--
+			}
+		case tabDownloads:
+			if m.dlCursor > 0 {
+				m.dlCursor--
+			}
+		case tabCompleted:
+			if m.dlCursor > 0 {
+				m.dlCursor--
+			}
+		case tabSources:
+			if m.srcCursor > 0 {
+				m.srcCursor--
+			}
+		}
+		return m, handled()
+
+	case "down", "j":
+		switch m.activeTab {
+		case tabSearch:
+			if m.mode == viewResults && m.cursor < len(m.results)-1 {
+				m.cursor++
+			}
+		case tabDownloads:
+			if m.dlCursor < len(m.downloading)-1 {
+				m.dlCursor++
+			}
+		case tabCompleted:
+			if m.dlCursor < len(m.completed)-1 {
+				m.dlCursor++
+			}
+		case tabSources:
+			if m.srcCursor < len(m.sources)-1 {
+				m.srcCursor++
+			}
+		}
+		return m, handled()
+
+	case "left", "h":
+		// Navigate sort columns (downloads/completed tabs)
+		if m.activeTab == tabDownloads {
+			if m.sortCol > 0 {
+				m.sortCol--
+			} else {
+				m.sortCol = 5 // Wrap to last column (6 columns)
+			}
+			return m, handled()
+		}
+		if m.activeTab == tabCompleted {
+			if m.sortCol > 0 {
+				m.sortCol--
+			} else {
+				m.sortCol = 3 // Wrap to last column (4 columns)
+			}
+			return m, handled()
+		}
+
+	case "right", "l":
+		// Navigate sort columns (downloads/completed tabs)
+		if m.activeTab == tabDownloads {
+			if m.sortCol < 5 {
+				m.sortCol++
+			} else {
+				m.sortCol = 0 // Wrap to first column
+			}
+			return m, handled()
+		}
+		if m.activeTab == tabCompleted {
+			if m.sortCol < 3 {
+				m.sortCol++
+			} else {
+				m.sortCol = 0 // Wrap to first column
+			}
+			return m, handled()
+		}
+
+	case "s": // Toggle sort direction
+		if m.activeTab == tabDownloads || m.activeTab == tabCompleted {
+			m.sortAsc = !m.sortAsc
+			return m, handled()
+		}
+
+	case "space":
+		// Toggle source enabled/disabled
+		if m.activeTab == tabSources && len(m.sources) > 0 && m.srcCursor < len(m.sources) {
+			m.sources[m.srcCursor].Enabled = !m.sources[m.srcCursor].Enabled
+			if m.sources[m.srcCursor].Enabled {
+				m.statusMsg = fmt.Sprintf("Enabled: %s", m.sources[m.srcCursor].Name)
+			} else {
+				m.statusMsg = fmt.Sprintf("Disabled: %s", m.sources[m.srcCursor].Name)
+			}
+			m.saveSources()
+			return m, handled()
+		}
+
+	case "a": // Add URL (sources tab)
+		if m.activeTab == tabSources {
+			m.addingURL = true
+			m.urlInput.Focus()
+			m.urlInput.SetValue("")
+			return m, handled()
+		}
+
+	case "d":
+		if m.activeTab == tabSearch && m.mode == viewResults && len(m.results) > 0 {
+			if !m.vpnStatus.Connected {
+				m.statusMsg = "VPN required! Press V to connect"
+				return m, handled()
+			}
+			return m, m.downloadTorrent()
+		}
+		return m, handled()
+
+	case "p": // Pause/Resume toggle
+		if m.activeTab == tabDownloads && len(m.downloading) > 0 {
+			return m, m.togglePauseTorrent()
+		}
+		return m, handled()
+
+	case "x", "delete": // Delete torrent or remove source
+		if m.activeTab == tabDownloads && len(m.downloading) > 0 {
+			return m, m.deleteTorrent(false)
+		}
+		if m.activeTab == tabCompleted && len(m.completed) > 0 {
+			return m, m.deleteTorrent(false)
+		}
+		if m.activeTab == tabSources && len(m.sources) > 0 && m.srcCursor < len(m.sources) {
+			src := m.sources[m.srcCursor]
+			if src.Builtin {
+				m.statusMsg = "Cannot remove built-in source"
+				return m, handled()
+			}
+			m.sources = append(m.sources[:m.srcCursor], m.sources[m.srcCursor+1:]...)
+			if m.srcCursor >= len(m.sources) && m.srcCursor > 0 {
+				m.srcCursor--
+			}
+			m.saveSources()
+			m.statusMsg = fmt.Sprintf("Removed: %s", src.Name)
+			return m, handled()
+		}
+		return m, handled()
+
+	case "X": // Delete with files
+		if m.activeTab == tabDownloads && len(m.downloading) > 0 {
+			return m, m.deleteTorrent(true)
+		}
+		if m.activeTab == tabCompleted && len(m.completed) > 0 {
+			return m, m.deleteTorrent(true)
+		}
+		return m, handled()
+
+	case "m": // Move to Plex (movies)
+		if m.activeTab == tabCompleted && len(m.completed) > 0 {
+			return m, m.moveToPlexMovie()
+		}
+		return m, handled()
+
+	case "t": // Move to Plex TV
+		if m.activeTab == tabCompleted && len(m.completed) > 0 {
+			return m, m.moveToPlexTV()
+		}
+		return m, handled()
+
+	case "v":
+		return m, m.checkVPNStatus()
+
+	case "V":
+		if !m.vpnStatus.Connected && !m.vpnConnecting {
+			m.vpnConnecting = true
+			m.statusMsg = "Connecting to VPN..."
+			return m, tea.Batch(m.spinner.Tick, m.connectVPN())
+		}
+		return m, handled()
+
+	case "/", "i": // / or i to focus search
+		m.activeTab = tabSearch
+		m.mode = viewSearch
+		m.searchInput.Focus()
+		return m, handled()
+
+	case "tab":
+		if m.mode == viewResults {
+			m.mode = viewDetails
+		} else if m.mode == viewDetails {
+			m.mode = viewResults
+		}
+		return m, handled()
+	}
+
+	return m, handled()
+}
+
+// Commands
+func (m Model) doSearch() tea.Cmd {
+	query := m.searchInput.Value()
+	sources := m.sources
+
+	return func() tea.Msg {
+		var allResults []scraper.Torrent
+		var lastErr error
+
+		// Search all enabled sources
+		for _, src := range sources {
+			if !src.Enabled || src.Scraper == nil {
+				continue
+			}
+
+			results, err := src.Scraper.Search(context.Background(), query)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			allResults = append(allResults, results...)
+		}
+
+		// Sort by health (best first)
+		sort.Slice(allResults, func(i, j int) bool {
+			return allResults[i].Health() > allResults[j].Health()
+		})
+
+		if len(allResults) == 0 && lastErr != nil {
+			return searchResultMsg{err: lastErr}
+		}
+
+		return searchResultMsg{results: allResults}
+	}
+}
+
+func (m Model) checkVPNStatus() tea.Cmd {
+	return func() tea.Msg {
+		status := m.vpnChecker.Check(context.Background())
+		return vpnStatusMsg{status: status}
+	}
+}
+
+func (m Model) connectVPN() tea.Cmd {
+	checker := m.vpnChecker
+	return func() tea.Msg {
+		err := checker.Connect(context.Background())
+		return vpnConnectMsg{err: err}
+	}
+}
+
+func (m Model) validateURL(rawURL string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		// Validate URL format and reachability
+		normalizedURL, err := scraper.ValidateURL(ctx, rawURL)
+		if err != nil {
+			return urlValidateMsg{url: rawURL, err: err}
+		}
+
+		// Test search to verify it works
+		resultCount, err := scraper.TestSearch(ctx, normalizedURL)
+		if err != nil {
+			return urlValidateMsg{url: normalizedURL, err: fmt.Errorf("test search failed: %w", err)}
+		}
+
+		if resultCount == 0 {
+			return urlValidateMsg{url: normalizedURL, err: fmt.Errorf("no results from test search")}
+		}
+
+		// Create a working scraper
+		s := scraper.NewGenericScraper(normalizedURL, normalizedURL)
+
+		return urlValidateMsg{
+			url:     normalizedURL,
+			name:    normalizedURL,
+			scraper: s,
+		}
+	}
+}
+
+// saveSources saves custom (non-builtin) sources to config
+func (m Model) saveSources() {
+	var customSources []config.SourceConfig
+	for _, src := range m.sources {
+		if !src.Builtin {
+			customSources = append(customSources, config.SourceConfig{
+				Name:    src.Name,
+				URL:     src.URL,
+				Enabled: src.Enabled,
+			})
+		}
+	}
+	m.cfg.Sources = customSources
+	_ = config.Save(m.cfg) // Ignore error, it's just persistence
+}
+
+func (m Model) checkQbitStatus() tea.Cmd {
+	return func() tea.Msg {
+		online := m.qbitClient.IsConnected(context.Background())
+		return qbitStatusMsg{online: online}
+	}
+}
+
+func (m Model) fetchTorrents() tea.Cmd {
+	client := m.qbitClient
+	return func() tea.Msg {
+		torrents, err := client.GetTorrents(context.Background())
+		if err != nil {
+			return torrentListMsg{err: err}
+		}
+
+		var downloading, completed []qbit.TorrentInfo
+		for _, t := range torrents {
+			// States: downloading, stalledDL, pausedDL, queuedDL, checkingDL
+			// completed: uploading, stalledUP, pausedUP, queuedUP, checkingUP, completed
+			switch t.State {
+			case "downloading", "stalledDL", "pausedDL", "queuedDL", "checkingDL", "metaDL", "forcedDL":
+				downloading = append(downloading, t)
+			default:
+				// Everything else is considered completed/seeding
+				if t.Progress >= 1.0 {
+					completed = append(completed, t)
+				} else {
+					downloading = append(downloading, t)
+				}
+			}
+		}
+
+		return torrentListMsg{downloading: downloading, completed: completed}
+	}
+}
+
+func (m Model) togglePauseTorrent() tea.Cmd {
+	if m.dlCursor >= len(m.downloading) {
+		return nil
+	}
+	t := m.downloading[m.dlCursor]
+	client := m.qbitClient
+	isPaused := strings.Contains(t.State, "paused")
+
+	return func() tea.Msg {
+		var err error
+		var action string
+		if isPaused {
+			err = client.Resume(context.Background(), t.Hash)
+			action = "Resumed"
+		} else {
+			err = client.Pause(context.Background(), t.Hash)
+			action = "Paused"
+		}
+		return torrentActionMsg{action: action, name: t.Name, err: err}
+	}
+}
+
+func (m Model) deleteTorrent(deleteFiles bool) tea.Cmd {
+	var t qbit.TorrentInfo
+	if m.activeTab == tabDownloads && m.dlCursor < len(m.downloading) {
+		t = m.downloading[m.dlCursor]
+	} else if m.activeTab == tabCompleted && m.dlCursor < len(m.completed) {
+		t = m.completed[m.dlCursor]
+	} else {
+		return nil
+	}
+
+	client := m.qbitClient
+	return func() tea.Msg {
+		err := client.Delete(context.Background(), t.Hash, deleteFiles)
+		action := "Removed"
+		if deleteFiles {
+			action = "Deleted"
+		}
+		return torrentActionMsg{action: action, name: t.Name, err: err}
+	}
+}
+
+func (m Model) moveToPlexMovie() tea.Cmd {
+	if m.dlCursor >= len(m.completed) {
+		return nil
+	}
+	t := m.completed[m.dlCursor]
+	savePath := t.SavePath
+
+	return func() tea.Msg {
+		home, _ := os.UserHomeDir()
+		script := filepath.Join(home, "Scripts", "move-to-plex.sh")
+		cmd := exec.CommandContext(context.Background(), "/bin/sh", script, savePath, t.Name)
+		err := cmd.Run()
+		return plexMoveMsg{name: t.Name, err: err}
+	}
+}
+
+func (m Model) moveToPlexTV() tea.Cmd {
+	if m.dlCursor >= len(m.completed) {
+		return nil
+	}
+	t := m.completed[m.dlCursor]
+	savePath := t.SavePath
+
+	return func() tea.Msg {
+		home, _ := os.UserHomeDir()
+		script := filepath.Join(home, "Scripts", "move-to-plex-tv.sh")
+		cmd := exec.CommandContext(context.Background(), "/bin/sh", script, savePath, t.Name)
+		err := cmd.Run()
+		return plexMoveMsg{name: t.Name, err: err}
+	}
+}
+
+func (m Model) loadFiles() tea.Cmd {
+	if m.cursor >= len(m.results) {
+		return nil
+	}
+	idx := m.cursor
+	t := &m.results[idx]
+
+	// Find the scraper for this torrent's source
+	var src scraper.Scraper
+	for _, s := range m.sources {
+		if s.Name == t.Source {
+			src = s.Scraper
+			break
+		}
+	}
+	if src == nil {
+		return nil
+	}
+
+	return func() tea.Msg {
+		err := src.GetFiles(context.Background(), t)
+		return filesLoadedMsg{index: idx, err: err}
+	}
+}
+
+func (m Model) downloadTorrent() tea.Cmd {
+	if m.cursor >= len(m.results) {
+		return nil
+	}
+	t := m.results[m.cursor]
+	client := m.qbitClient
+	savePath := m.cfg.Downloads.Path
+
+	// Find the scraper for this torrent's source
+	var src scraper.Scraper
+	for _, s := range m.sources {
+		if s.Name == t.Source {
+			src = s.Scraper
+			break
+		}
+	}
+
+	return func() tea.Msg {
+		// Get magnet if not already loaded
+		if t.Magnet == "" || !strings.HasPrefix(t.Magnet, "magnet:") {
+			if src != nil {
+				if err := src.GetFiles(context.Background(), &t); err != nil {
+					return torrentAddedMsg{err: err}
+				}
+			}
+		}
+
+		// Some sources provide .torrent URLs instead of magnets
+		// qBittorrent can handle both
+		if t.Magnet == "" {
+			return torrentAddedMsg{err: fmt.Errorf("no download link available")}
+		}
+
+		err := client.AddMagnet(context.Background(), t.Magnet, savePath)
+		return torrentAddedMsg{name: t.Name, err: err}
+	}
+}
+
+// View renders the UI
+func (m Model) View() string {
+	styles := GetStyles()
+
+	var b strings.Builder
+
+	// Logo header (always visible)
+	b.WriteString(m.renderLogo())
+
+	// Status bar (mode, status, help) + connection indicators
+	b.WriteString(m.renderStatusBar())
+	b.WriteString("\n\n")
+
+	// Tab bar
+	tabBar := m.renderTabBar()
+	b.WriteString(tabBar)
+	b.WriteString("\n\n")
+
+	// Main content - logo is ~12 lines, status ~1, tabs ~2
+	contentHeight := m.height - 18
+	if contentHeight < 5 {
+		contentHeight = 5
+	}
+
+	// Handle VPN connect mode specially
+	if m.mode == viewVPNConnect {
+		if m.vpnConnecting {
+			b.WriteString(m.spinner.View() + " Connecting to VPN (selecting lowest latency US server)...")
+		} else {
+			b.WriteString(styles.Error.Render("VPN Required"))
+			b.WriteString("\n\n")
+			b.WriteString(styles.Muted.Render("Torrent operations require an active VPN connection."))
+			b.WriteString("\n\n")
+			b.WriteString(styles.HelpDesc.Render("Press Enter to connect to NordVPN"))
+			b.WriteString("\n")
+			b.WriteString(styles.Muted.Render("Press q to quit"))
+		}
+	} else {
+		// Render based on active tab
+		switch m.activeTab {
+		case tabSearch:
+			b.WriteString(m.renderSearchTab(contentHeight))
+		case tabDownloads:
+			b.WriteString(m.renderDownloadsTab(contentHeight))
+		case tabCompleted:
+			b.WriteString(m.renderCompletedTab(contentHeight))
+		case tabSources:
+			b.WriteString(m.renderSourcesTab(contentHeight))
+		}
+	}
+
+	return b.String()
+}
+
+func (m Model) renderLogo() string {
+	// ASCII art with gradient coloring derived from theme FG
+	logo := []string{
+		`  ████████╗ ██████╗ ██████╗ ██████╗ ███████╗███╗   ██╗████████╗`,
+		`  ╚══██╔══╝██╔═══██╗██╔══██╗██╔══██╗██╔════╝████╗  ██║╚══██╔══╝`,
+		`     ██║   ██║   ██║██████╔╝██████╔╝█████╗  ██╔██╗ ██║   ██║   `,
+		`     ██║   ██║   ██║██╔══██╗██╔══██╗██╔══╝  ██║╚██╗██║   ██║   `,
+		`     ██║   ╚██████╔╝██║  ██║██║  ██║███████╗██║ ╚████║   ██║   `,
+		`     ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝   ╚═╝   `,
+	}
+
+	// Sunset orange gradient - bright yellow-orange at top fading to deep red
+	colors := []string{
+		"#FFCC00", // Bright golden yellow
+		"#FF9500", // Vibrant orange
+		"#FF6B35", // Warm orange
+		"#E84A27", // Deep orange-red
+		"#C43520", // Burnt sienna
+		"#8B2500", // Dark rust
+	}
+
+	var b strings.Builder
+	b.WriteString("\n")
+
+	for i, line := range logo {
+		color := colors[i]
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
+		b.WriteString(style.Render(line))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+
+	// Tagline and copyright
+	styles := GetStyles()
+	tagline := "  Search torrents across multiple sources"
+	b.WriteString(styles.Muted.Render(tagline))
+	b.WriteString("\n")
+	copyright := "  (c) 2025 litescript.net | v0.1.0"
+	b.WriteString(styles.Muted.Render(copyright))
+	b.WriteString("\n\n")
+
+	return b.String()
+}
+
+func (m Model) renderTabBar() string {
+	styles := GetStyles()
+
+	// Count enabled sources
+	enabledSources := 0
+	for _, s := range m.sources {
+		if s.Enabled {
+			enabledSources++
+		}
+	}
+
+	tabs := []struct {
+		name  string
+		tab   tabType
+		count int
+	}{
+		{"[1]Search", tabSearch, len(m.results)},
+		{"[2]Downloads", tabDownloads, len(m.downloading)},
+		{"[3]Completed", tabCompleted, len(m.completed)},
+		{"[4]Sources", tabSources, enabledSources},
+	}
+
+	var parts []string
+	for _, t := range tabs {
+		label := t.name
+		if t.count > 0 {
+			label = fmt.Sprintf("%s(%d)", t.name, t.count)
+		}
+
+		if t.tab == m.activeTab {
+			parts = append(parts, styles.Title.Render(label))
+		} else {
+			parts = append(parts, styles.Muted.Render(label))
+		}
+	}
+
+	tabLine := strings.Join(parts, "  ")
+	hint := styles.Muted.Render("Alt+1-4 to switch tabs")
+
+	return tabLine + "\n" + hint
+}
+
+func (m Model) renderSearchTab(height int) string {
+	styles := GetStyles()
+	var b strings.Builder
+
+	// Search bar
+	prompt := styles.SearchPrompt.Render("Search: ")
+	b.WriteString(prompt + m.searchInput.View())
+	b.WriteString("\n")
+
+	switch m.mode {
+	case viewSearch:
+		if m.err != nil {
+			b.WriteString(styles.Error.Render(fmt.Sprintf("Error: %v", m.err)))
+		} else if m.searching {
+			b.WriteString(m.spinner.View() + " Searching...")
+		}
+	case viewResults, viewDetails:
+		b.WriteString(m.renderResults(height - 1))
+	}
+
+	return b.String()
+}
+
+// sortTorrents sorts a slice of torrents by the specified column
+func sortTorrents(torrents []qbit.TorrentInfo, col int, asc bool) {
+	sort.Slice(torrents, func(i, j int) bool {
+		var less bool
+		switch col {
+		case 0: // Name
+			less = strings.ToLower(torrents[i].Name) < strings.ToLower(torrents[j].Name)
+		case 1: // Size
+			less = torrents[i].Size < torrents[j].Size
+		case 2: // Done/Progress
+			less = torrents[i].Progress < torrents[j].Progress
+		case 3: // DL speed
+			less = torrents[i].DLSpeed < torrents[j].DLSpeed
+		case 4: // UL speed
+			less = torrents[i].UPSpeed < torrents[j].UPSpeed
+		case 5: // ETA
+			etaI := calcETA(torrents[i].AmountLeft, torrents[i].DLSpeed)
+			etaJ := calcETA(torrents[j].AmountLeft, torrents[j].DLSpeed)
+			less = etaI < etaJ
+		default:
+			less = torrents[i].Name < torrents[j].Name
+		}
+		if asc {
+			return less
+		}
+		return !less
+	})
+}
+
+func calcETA(amountLeft, dlSpeed int64) int64 {
+	if dlSpeed == 0 {
+		return 1<<62 - 1 // Very large number for infinite
+	}
+	return amountLeft / dlSpeed
+}
+
+// sortCompletedTorrents sorts completed torrents (4 columns: name, size, ratio, uploaded)
+func sortCompletedTorrents(torrents []qbit.TorrentInfo, col int, asc bool) {
+	sort.Slice(torrents, func(i, j int) bool {
+		var less bool
+		switch col {
+		case 0: // Name
+			less = strings.ToLower(torrents[i].Name) < strings.ToLower(torrents[j].Name)
+		case 1: // Size
+			less = torrents[i].Size < torrents[j].Size
+		case 2: // Ratio
+			ratioI := float64(torrents[i].UploadedEver) / float64(torrents[i].Size)
+			ratioJ := float64(torrents[j].UploadedEver) / float64(torrents[j].Size)
+			less = ratioI < ratioJ
+		case 3: // Uploaded
+			less = torrents[i].UploadedEver < torrents[j].UploadedEver
+		default:
+			less = torrents[i].Name < torrents[j].Name
+		}
+		if asc {
+			return less
+		}
+		return !less
+	})
+}
+
+func (m Model) renderDownloadsTab(height int) string {
+	styles := GetStyles()
+	var b strings.Builder
+
+	if len(m.downloading) == 0 {
+		b.WriteString(styles.Muted.Render("No active downloads"))
+		return b.String()
+	}
+
+	// Column widths - must match row widths exactly
+	// Rows have 2-char prefix ("› " or "  "), so header needs it too
+	colWidths := []int{0, 8, 7, 11, 11, 8}             // nameWidth set below, others fixed
+	nameWidth := m.width - 2 - 8 - 7 - 11 - 11 - 8 - 5 // 2=prefix, 5=spaces between cols
+	if nameWidth < 20 {
+		nameWidth = 20
+	}
+	colWidths[0] = nameWidth
+
+	colNames := []string{"NAME", "SIZE", "DONE", "DL", "UL", "ETA"}
+
+	// Build header with sort indicator - sorted column gets highlighted
+	var headerParts []string
+	for i, name := range colNames {
+		w := colWidths[i]
+		ind := " "
+		if i == m.sortCol {
+			if m.sortAsc {
+				ind = "▲"
+			} else {
+				ind = "▼"
+			}
+		}
+		// Build column text - indicator right after name, padded to full width
+		// Note: unicode arrows are 3 bytes but 1 display char, so calculate padding manually
+		var colText string
+		if i == len(colNames)-1 {
+			// Last column (ETA): right-align, indicator prepended
+			padding := w - len(name) - 1
+			if padding < 0 {
+				padding = 0
+			}
+			colText = repeat(" ", padding) + ind + name
+		} else {
+			// Others: left-align, indicator right after name
+			padding := w - len(name) - 1
+			if padding < 0 {
+				padding = 0
+			}
+			colText = name + ind + repeat(" ", padding)
+		}
+		// Apply style - sorted column highlighted, others muted
+		if i == m.sortCol {
+			headerParts = append(headerParts, styles.SortedHeader.Render(colText))
+		} else {
+			headerParts = append(headerParts, styles.Muted.Render(colText))
+		}
+	}
+	// Add 2-char prefix to match row prefix ("› " or "  ")
+	header := "  " + strings.Join(headerParts, styles.Muted.Render(" "))
+	// Render with border only (no foreground color override)
+	headerStyle := lipgloss.NewStyle().
+		Bold(true).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderBottom(true).
+		BorderForeground(lipgloss.Color(theme.CurrentPalette.Muted))
+	b.WriteString(headerStyle.Render(header))
+	b.WriteString("\n")
+
+	// Sort torrents
+	sorted := make([]qbit.TorrentInfo, len(m.downloading))
+	copy(sorted, m.downloading)
+	sortTorrents(sorted, m.sortCol, m.sortAsc)
+
+	// Rows
+	visibleRows := height - 2
+	if visibleRows < 1 {
+		visibleRows = 1
+	}
+
+	startIdx := 0
+	if m.dlCursor >= visibleRows {
+		startIdx = m.dlCursor - visibleRows + 1
+	}
+
+	endIdx := startIdx + visibleRows
+	if endIdx > len(sorted) {
+		endIdx = len(sorted)
+	}
+
+	for i := startIdx; i < endIdx; i++ {
+		t := sorted[i]
+		name := TruncateString(t.Name, nameWidth-2) // -2 for "› " prefix
+		progress := fmt.Sprintf("%.1f%%", t.Progress*100)
+		dlSpeed := formatSpeed(t.DLSpeed)
+		ulSpeed := formatSpeed(t.UPSpeed)
+		eta := formatETA(t.AmountLeft, t.DLSpeed)
+		size := formatSize(t.Size)
+
+		// Match header widths exactly: nameWidth, 8, 7, 11, 11, 8
+		// All left-aligned except ETA (right-aligned)
+		row := fmt.Sprintf("%s %s %s %s %s %s",
+			PadRight(name, nameWidth),
+			PadRight(size, 8),
+			PadRight(progress, 7),
+			PadRight(dlSpeed, 11),
+			PadRight(ulSpeed, 11),
+			PadLeft(eta, 8))
+
+		if i == m.dlCursor {
+			b.WriteString(styles.TableSelected.Render("› " + row))
+		} else {
+			b.WriteString(styles.TableRow.Render("  " + row))
+		}
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
+func (m Model) renderCompletedTab(height int) string {
+	styles := GetStyles()
+	var b strings.Builder
+
+	if len(m.completed) == 0 {
+		b.WriteString(styles.Muted.Render("No completed torrents"))
+		return b.String()
+	}
+
+	// Column widths - must match row widths exactly
+	// Rows have 2-char prefix ("› " or "  "), so header needs it too
+	colWidths := []int{0, 8, 7, 11}           // nameWidth set below, others fixed
+	nameWidth := m.width - 2 - 8 - 7 - 11 - 3 // 2=prefix, 3=spaces between cols
+	if nameWidth < 20 {
+		nameWidth = 20
+	}
+	colWidths[0] = nameWidth
+
+	colNames := []string{"NAME", "SIZE", "RATIO", "UPLOADED"}
+
+	// Build header with sort indicator - sorted column gets highlighted
+	var headerParts []string
+	for i, name := range colNames {
+		w := colWidths[i]
+		ind := " "
+		if i == m.sortCol {
+			if m.sortAsc {
+				ind = "▲"
+			} else {
+				ind = "▼"
+			}
+		}
+		// Build column text - indicator right after name, padded to full width
+		// Note: unicode arrows are 3 bytes but 1 display char, so calculate padding manually
+		var colText string
+		if i == len(colNames)-1 {
+			// Last column: right-align, indicator prepended
+			padding := w - len(name) - 1
+			if padding < 0 {
+				padding = 0
+			}
+			colText = repeat(" ", padding) + ind + name
+		} else {
+			// Others: left-align, indicator right after name
+			padding := w - len(name) - 1
+			if padding < 0 {
+				padding = 0
+			}
+			colText = name + ind + repeat(" ", padding)
+		}
+		// Apply style - sorted column highlighted, others muted
+		if i == m.sortCol {
+			headerParts = append(headerParts, styles.SortedHeader.Render(colText))
+		} else {
+			headerParts = append(headerParts, styles.Muted.Render(colText))
+		}
+	}
+	// Add 2-char prefix to match row prefix ("› " or "  ")
+	header := "  " + strings.Join(headerParts, styles.Muted.Render(" "))
+	// Render with border only (no foreground color override)
+	headerStyle := lipgloss.NewStyle().
+		Bold(true).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderBottom(true).
+		BorderForeground(lipgloss.Color(theme.CurrentPalette.Muted))
+	b.WriteString(headerStyle.Render(header))
+	b.WriteString("\n")
+
+	// Sort torrents
+	sorted := make([]qbit.TorrentInfo, len(m.completed))
+	copy(sorted, m.completed)
+	sortCompletedTorrents(sorted, m.sortCol, m.sortAsc)
+
+	// Rows
+	visibleRows := height - 2
+	if visibleRows < 1 {
+		visibleRows = 1
+	}
+
+	startIdx := 0
+	if m.dlCursor >= visibleRows {
+		startIdx = m.dlCursor - visibleRows + 1
+	}
+
+	endIdx := startIdx + visibleRows
+	if endIdx > len(sorted) {
+		endIdx = len(sorted)
+	}
+
+	for i := startIdx; i < endIdx; i++ {
+		t := sorted[i]
+		name := TruncateString(t.Name, nameWidth-2) // -2 for "› " prefix
+		size := formatSize(t.Size)
+		ratio := fmt.Sprintf("%.2f", float64(t.UploadedEver)/float64(t.Size))
+		uploaded := formatSize(t.UploadedEver)
+
+		// Match header widths exactly: nameWidth, 8, 7, 11
+		// All left-aligned except UPLOADED (right-aligned)
+		row := fmt.Sprintf("%s %s %s %s",
+			PadRight(name, nameWidth),
+			PadRight(size, 8),
+			PadRight(ratio, 7),
+			PadLeft(uploaded, 11))
+
+		if i == m.dlCursor {
+			b.WriteString(styles.TableSelected.Render("› " + row))
+		} else {
+			b.WriteString(styles.TableRow.Render("  " + row))
+		}
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
+func (m Model) renderSourcesTab(height int) string {
+	styles := GetStyles()
+	var b strings.Builder
+
+	// Title and add URL input
+	if m.addingURL {
+		prompt := styles.SearchPrompt.Render("Add URL: ")
+		b.WriteString(prompt + m.urlInput.View())
+		b.WriteString("\n\n")
+	} else {
+		b.WriteString(styles.PanelTitle.Render("Search Sources"))
+		b.WriteString("  ")
+		b.WriteString(styles.Muted.Render("[a]Add URL  [enter]Toggle  [x]Remove"))
+		b.WriteString("\n\n")
+	}
+
+	if len(m.sources) == 0 {
+		b.WriteString(styles.Muted.Render("No sources configured. Press 'a' to add one."))
+		return b.String()
+	}
+
+	// Header
+	nameWidth := m.width - 30
+	if nameWidth < 20 {
+		nameWidth = 20
+	}
+
+	header := fmt.Sprintf("%s %s %s",
+		PadRight("SOURCE", nameWidth),
+		PadLeft("STATUS", 12),
+		PadLeft("TYPE", 10))
+	b.WriteString(styles.TableHeader.Render(header))
+	b.WriteString("\n")
+
+	// Rows
+	visibleRows := height - 4
+	if visibleRows < 1 {
+		visibleRows = 1
+	}
+
+	startIdx := 0
+	if m.srcCursor >= visibleRows {
+		startIdx = m.srcCursor - visibleRows + 1
+	}
+
+	endIdx := startIdx + visibleRows
+	if endIdx > len(m.sources) {
+		endIdx = len(m.sources)
+	}
+
+	for i := startIdx; i < endIdx; i++ {
+		src := m.sources[i]
+
+		name := TruncateString(src.Name, nameWidth-1)
+
+		var status, statusStyle string
+		if src.Enabled {
+			status = "Enabled"
+			statusStyle = styles.VPNConnected.Render(status)
+		} else {
+			status = "Disabled"
+			statusStyle = styles.Muted.Render(status)
+		}
+
+		srcType := "Builtin"
+		if src.Scraper == nil {
+			srcType = "Custom"
+		}
+
+		row := fmt.Sprintf("%s %s %s",
+			PadRight(name, nameWidth),
+			PadLeft(statusStyle, 12+len(statusStyle)-len(status)), // Account for ANSI codes
+			PadLeft(srcType, 10))
+
+		if i == m.srcCursor {
+			b.WriteString(styles.TableSelected.Render("› ") + row)
+		} else {
+			b.WriteString(styles.TableRow.Render("  ") + row)
+		}
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
+func (m Model) renderResults(height int) string {
+	styles := GetStyles()
+
+	if len(m.results) == 0 {
+		return styles.Muted.Render("No results")
+	}
+
+	var b strings.Builder
+
+	// Table header
+	nameWidth := m.width - 50
+	if nameWidth < 20 {
+		nameWidth = 20
+	}
+
+	header := fmt.Sprintf("%s %s %s %s %s",
+		PadRight("NAME", nameWidth),
+		PadLeft("SIZE", 10),
+		PadLeft("S", 5),
+		PadLeft("L", 5),
+		"HEALTH")
+	b.WriteString(styles.TableHeader.Render(header))
+	b.WriteString("\n")
+
+	// Calculate visible range
+	visibleRows := height - 3
+	if visibleRows < 1 {
+		visibleRows = 1
+	}
+
+	startIdx := 0
+	if m.cursor >= visibleRows {
+		startIdx = m.cursor - visibleRows + 1
+	}
+
+	endIdx := startIdx + visibleRows
+	if endIdx > len(m.results) {
+		endIdx = len(m.results)
+	}
+
+	// Render rows
+	for i := startIdx; i < endIdx; i++ {
+		t := m.results[i]
+		name := TruncateString(t.Name, nameWidth-1)
+
+		row := fmt.Sprintf("%s %s %s %s %s",
+			PadRight(name, nameWidth),
+			PadLeft(t.Size, 10),
+			PadLeft(fmt.Sprintf("%d", t.Seeders), 5),
+			PadLeft(fmt.Sprintf("%d", t.Leechers), 5),
+			HealthBar(t.Health(), 5))
+
+		if i == m.cursor {
+			prefix := "› "
+			b.WriteString(styles.TableSelected.Render(prefix + row))
+		} else {
+			prefix := "  "
+			b.WriteString(styles.TableRow.Render(prefix + row))
+		}
+		b.WriteString("\n")
+	}
+
+	// Files panel (if in details mode and files loaded)
+	if m.mode == viewDetails && m.cursor < len(m.results) {
+		t := m.results[m.cursor]
+		if len(t.Files) > 0 {
+			b.WriteString("\n")
+			b.WriteString(styles.PanelTitle.Render(fmt.Sprintf("FILES (%d)", len(t.Files))))
+			b.WriteString("\n")
+			for i, f := range t.Files {
+				if i >= 5 {
+					b.WriteString(styles.Muted.Render(fmt.Sprintf("  ... and %d more", len(t.Files)-5)))
+					break
+				}
+				line := fmt.Sprintf("  %s", f.Name)
+				if f.Size != "" {
+					line += fmt.Sprintf("  %s", f.Size)
+				}
+				b.WriteString(styles.Muted.Render(TruncateString(line, m.width-4)))
+				b.WriteString("\n")
+			}
+		}
+	}
+
+	return b.String()
+}
+
+func (m Model) renderStatusBar() string {
+	styles := GetStyles()
+
+	// Connection indicators
+	var vpnStr string
+	if m.vpnStatus.Connected {
+		vpnStr = styles.VPNConnected.Render("● VPN")
+	} else {
+		vpnStr = styles.VPNDisconnect.Render("○ VPN")
+	}
+
+	var qbitStr string
+	if m.qbitOnline {
+		qbitStr = styles.VPNConnected.Render("● qBit")
+	} else {
+		qbitStr = styles.VPNDisconnect.Render("○ qBit")
+	}
+
+	// Mode indicator
+	var modeStr string
+	if m.searchInput.Focused() {
+		modeStr = styles.VPNConnected.Render("INPUT")
+	} else {
+		modeStr = styles.HealthMed.Render("CMD")
+	}
+
+	// Context-sensitive help (mode + tab aware)
+	var help string
+	if m.searchInput.Focused() {
+		help = "[esc]CMD [enter]Search"
+	} else if m.addingURL {
+		help = "[esc]Cancel [enter]Add"
+	} else {
+		switch m.activeTab {
+		case tabDownloads:
+			help = "[←→]Sort col [s]Toggle sort [p]Pause [x]Remove [q]Back"
+		case tabCompleted:
+			help = "[←→]Sort col [s]Toggle sort [m]Plex [x]Remove [q]Back"
+		case tabSources:
+			help = "[a]Add [enter]Toggle [x]Remove [q]Back"
+		default:
+			help = "[/]Search [d]Download [v]VPN [q]Quit"
+		}
+	}
+
+	// Left side: mode + status message
+	var leftPart string
+	if m.statusMsg != "" {
+		leftPart = modeStr + " │ " + m.statusMsg
+	} else {
+		leftPart = modeStr
+	}
+
+	// Right side: connection status
+	rightLine1 := qbitStr + "  " + vpnStr
+
+	// Line 2: context-sensitive shortcuts (right-justified)
+	rightLine2 := styles.HelpKey.Render(help)
+
+	// Build line 1
+	leftWidth := lipgloss.Width(leftPart)
+	rightWidth1 := lipgloss.Width(rightLine1)
+	padding1 := m.width - leftWidth - rightWidth1 - 4
+	if padding1 < 1 {
+		padding1 = 1
+	}
+	line1 := leftPart + strings.Repeat(" ", padding1) + rightLine1
+
+	// Build line 2 (right-justified)
+	rightWidth2 := lipgloss.Width(rightLine2)
+	padding2 := m.width - rightWidth2 - 2
+	if padding2 < 0 {
+		padding2 = 0
+	}
+	line2 := strings.Repeat(" ", padding2) + rightLine2
+
+	return line1 + "\n" + line2
+}

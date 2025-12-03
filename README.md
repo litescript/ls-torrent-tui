@@ -122,7 +122,7 @@ By default, no search sources are configured. To add a source:
 
 1. Open the application and navigate to the **Sources** tab
 2. Press `a` to add a new source
-3. Enter the URL of a site that provides magnet links
+3. Enter the URL of a source that returns magnet links for content you're allowed to access
 4. The generic scraper will attempt to parse search results
 
 Sources are saved to your config file and persist between sessions.

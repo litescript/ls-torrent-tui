@@ -1,0 +1,24 @@
+# Build output
+bin/
+build/
+dist/
+
+# Test output
+*.test
+*.out
+coverage.out
+*.prof
+
+# Logs
+*.log
+
+# Editor/IDE
+*.swp
+*.tmp
+.idea/
+.vscode/
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db

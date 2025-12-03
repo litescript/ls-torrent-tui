@@ -4,6 +4,15 @@ A terminal user interface for managing qBittorrent and organizing torrent downlo
 
 This is a **client and management interface** for qBittorrent—it helps you monitor, control, and organize your existing torrents through a clean terminal UI. It does not provide or index any content.
 
+## What This Project Is *Not*
+
+- Not a torrent indexer
+- Not a scraper for any real sites
+- Not a tool for finding copyrighted material
+- Not a VPN/anonymity tool
+
+It is only a **local qBittorrent client + file organizer**. All providers are user-supplied.
+
 ## Features
 
 - **qBittorrent Management** — Monitor and control torrents via the qBittorrent Web API
@@ -15,12 +24,9 @@ This is a **client and management interface** for qBittorrent—it helps you mon
 
 ## Safety & Intended Use
 
-This project is designed for managing legally obtained content:
-
-- **No built-in indexers** — The application does not ship with any torrent search providers
-- **User-configured sources** — Users must supply and configure their own search providers
-- **Legal use only** — This tool is intended for managing legitimate torrent downloads
-- **No endorsement** — The authors do not endorse or encourage copyright infringement
+This project ships **no real indexers/scrapers** and does **not** endorse copyright infringement.
+All provider configs must use **placeholder domains**.
+Users must ensure legal compliance and supply their own sources.
 
 ## How It Works
 
@@ -88,11 +94,16 @@ movie_library = "/media/Movies"
 tv_library = "/media/TV Shows"
 auto_detect = true
 
-# User-defined search sources
+# User-defined search sources (placeholder examples)
 # [[sources]]
-# name = "My Source"
-# url = "https://example.com"
+# name = "local-json-catalog"
+# url = "http://127.0.0.1:8081/search"
 # enabled = true
+
+# [[sources]]
+# name = "example-scraper"
+# url = "https://example.local"
+# enabled = false
 ```
 
 ### Configuration Sections

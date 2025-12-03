@@ -2,6 +2,12 @@
 
 Thank you for your interest in contributing! This document outlines the guidelines and expectations for contributions to keep the project safe, clean, and maintainable.
 
+## Content & Legal Scope
+
+No real torrent/streaming domains allowed in:
+code, comments, docs, configs, issues, or PRs.
+Use only placeholder names (e.g., example-index, local-json-catalog).
+
 ## Getting Started
 
 ### Fork and Clone
@@ -158,6 +164,8 @@ if idx >= 0 && idx < len(items) {
 - [ ] New behavior has tests (where applicable)
 - [ ] Documentation is updated (where applicable)
 - [ ] Commit messages are clear and descriptive
+- [ ] No real torrent/streaming domains included
+- [ ] All provider examples use placeholder names/URLs
 
 ## Questions?
 

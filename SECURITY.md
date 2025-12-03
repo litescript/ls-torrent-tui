@@ -10,6 +10,11 @@ The application:
 - Stores configuration in a local file (`~/.config/torrent-tui/config.toml`)
 - Does not transmit data to external services (except user-configured search providers)
 
+## Threat Model
+
+ls-torrent-tui is a **local** terminal app talking to a **local/LAN** qBittorrent instance.
+It is not a privacy, anonymity, or VPN tool. Network exposure of qBittorrent is the user's responsibility.
+
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability, please report it responsibly:

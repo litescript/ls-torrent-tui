@@ -21,6 +21,7 @@ import (
 	"github.com/litescript/ls-torrent-tui/internal/qbit"
 	"github.com/litescript/ls-torrent-tui/internal/scraper"
 	"github.com/litescript/ls-torrent-tui/internal/theme"
+	"github.com/litescript/ls-torrent-tui/internal/version"
 	"github.com/litescript/ls-torrent-tui/internal/vpn"
 )
 
@@ -108,6 +109,10 @@ type searchResultMsg struct {
 
 type vpnStatusMsg struct {
 	status vpn.Status
+}
+
+type updateCheckMsg struct {
+	info version.UpdateInfo
 }
 
 type qbitStatusMsg struct {
@@ -293,6 +298,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case qbitStatusMsg:
 		m.qbitOnline = msg.online
+
+	case updateCheckMsg:
+		if msg.info.Error != nil {
+			m.statusMsg = fmt.Sprintf("Update check failed: %v", msg.info.Error)
+		} else if msg.info.UpdateAvailable {
+			m.statusMsg = fmt.Sprintf("Update available: v%s -> v%s (run: %s)",
+				msg.info.CurrentVersion, msg.info.LatestVersion, version.InstallCommand())
+		} else {
+			m.statusMsg = fmt.Sprintf("You're on the latest version (v%s)", msg.info.CurrentVersion)
+		}
 
 	case filesLoadedMsg:
 		if msg.err != nil {
@@ -733,6 +748,10 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, handled()
 
+	case "u":
+		m.statusMsg = "Checking for updates..."
+		return m, checkForUpdate()
+
 	case "/", "i": // / or i to focus search
 		m.activeTab = tabSearch
 		m.mode = viewSearch
@@ -799,6 +818,13 @@ func (m Model) connectVPN() tea.Cmd {
 	return func() tea.Msg {
 		err := checker.Connect(context.Background())
 		return vpnConnectMsg{err: err}
+	}
+}
+
+func checkForUpdate() tea.Cmd {
+	return func() tea.Msg {
+		info := version.CheckForUpdate()
+		return updateCheckMsg{info: info}
 	}
 }
 
@@ -1116,7 +1142,7 @@ func (m Model) renderLogo() string {
 	tagline := "  Search torrents across multiple sources"
 	b.WriteString(styles.Muted.Render(tagline))
 	b.WriteString("\n")
-	copyright := "  (c) 2025 litescript.net | v0.1.0"
+	copyright := fmt.Sprintf("  (c) 2025 litescript.net | v%s", version.Version)
 	b.WriteString(styles.Muted.Render(copyright))
 	b.WriteString("\n\n")
 

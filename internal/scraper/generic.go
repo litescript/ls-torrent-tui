@@ -68,8 +68,9 @@ func setBrowserHeaders(req *http.Request) {
 // Search queries the site for torrents
 func (s *GenericScraper) Search(ctx context.Context, query string) ([]Torrent, error) {
 	// Try common search URL patterns
-	// Note: /?s= is WordPress-style but causes false positives on some sites
+	// Order matters: more specific patterns first, generic patterns last
 	searchPatterns := []string{
+		s.baseURL + "/browse-movies/" + url.PathEscape(query), // YTS-style
 		s.baseURL + "/search/all/" + url.PathEscape(query) + "/",
 		s.baseURL + "/search/" + url.PathEscape(query) + "/",
 		s.baseURL + "/search/" + url.PathEscape(query),
@@ -164,7 +165,79 @@ func (s *GenericScraper) extractTorrents(doc *goquery.Document) []Torrent {
 		results = s.extractFromTables(doc)
 	}
 
+	// Strategy 3: Look for movie/torrent links in divs (YTS-style sites)
+	if len(results) == 0 {
+		results = s.extractFromDivs(doc)
+	}
+
 	return results
+}
+
+// extractFromDivs looks for movie/torrent links in div-based layouts (like YTS)
+func (s *GenericScraper) extractFromDivs(doc *goquery.Document) []Torrent {
+	var results []Torrent
+	seen := make(map[string]bool)
+
+	// Look for links to movie/torrent detail pages - prefer title links
+	doc.Find("a[class*='title'], a[class*='name'], a.browse-movie-title").Each(func(i int, link *goquery.Selection) {
+		s.extractDivLink(link, seen, &results)
+	})
+
+	// Fallback: look for any movie/torrent links if we didn't find title-specific ones
+	if len(results) == 0 {
+		doc.Find("a").Each(func(i int, link *goquery.Selection) {
+			s.extractDivLink(link, seen, &results)
+		})
+	}
+
+	return results
+}
+
+func (s *GenericScraper) extractDivLink(link *goquery.Selection, seen map[string]bool, results *[]Torrent) {
+	href, _ := link.Attr("href")
+	linkText := strings.TrimSpace(link.Text())
+
+	// Skip empty links or already seen
+	if href == "" || linkText == "" || seen[href] {
+		return
+	}
+
+	// Skip non-title text (ratings, genres, etc.)
+	if strings.Contains(linkText, "/") || len(linkText) < 3 || len(linkText) > 200 {
+		return
+	}
+
+	// Look for movie/torrent detail page links
+	if strings.Contains(href, "/movies/") || strings.Contains(href, "/torrent/") {
+		// Skip external links
+		if strings.HasPrefix(href, "http") && !strings.Contains(href, s.baseURL) {
+			return
+		}
+		// Skip browse/category links
+		if strings.Contains(href, "browse") || strings.Contains(href, "category") {
+			return
+		}
+
+		seen[href] = true
+
+		t := Torrent{
+			Source: s.name,
+			Name:   linkText,
+		}
+
+		if !strings.HasPrefix(href, "http") {
+			t.InfoURL = s.baseURL + href
+		} else {
+			t.InfoURL = href
+		}
+
+		// Clean up URL (remove tracking params after ?)
+		if idx := strings.Index(t.InfoURL, "?"); idx != -1 {
+			t.InfoURL = t.InfoURL[:idx]
+		}
+
+		*results = append(*results, t)
+	}
 }
 
 // extractInfoFromContext looks at surrounding elements for torrent metadata
@@ -239,7 +312,7 @@ func (s *GenericScraper) extractFromTables(doc *goquery.Document) []Torrent {
 					if t.Name == "" {
 						t.Name = extractMagnetName(href)
 					}
-				} else if strings.Contains(href, "torrent") || strings.Contains(href, "download") {
+				} else if strings.Contains(href, "torrent") || strings.Contains(href, "download") || strings.Contains(href, "/movies/") {
 					// Skip direct .torrent file downloads (like itorrents.net) - prefer detail pages
 					if strings.Contains(href, "itorrents.net") || strings.HasSuffix(href, ".torrent") {
 						return

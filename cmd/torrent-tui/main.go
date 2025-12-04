@@ -11,9 +11,19 @@ import (
 	"github.com/litescript/ls-torrent-tui/internal/config"
 	"github.com/litescript/ls-torrent-tui/internal/theme"
 	"github.com/litescript/ls-torrent-tui/internal/tui"
+	"github.com/litescript/ls-torrent-tui/internal/version"
 )
 
 func main() {
+	// Handle --version / -v flag
+	if len(os.Args) > 1 {
+		arg := os.Args[1]
+		if arg == "--version" || arg == "-v" {
+			fmt.Printf("torrent-tui v%s\n", version.Version)
+			os.Exit(0)
+		}
+	}
+
 	// Load config
 	cfg, err := config.Load()
 	if err != nil {

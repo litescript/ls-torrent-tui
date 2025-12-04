@@ -52,6 +52,24 @@ The TUI is built with Go using [Bubble Tea](https://github.com/charmbracelet/bub
 go install github.com/litescript/ls-torrent-tui/cmd/torrent-tui@latest
 ```
 
+This installs the binary to your Go bin directory (`$GOBIN`, or `$GOPATH/bin`, or `$HOME/go/bin` by default).
+
+**Ensure Go's bin directory is in your PATH:**
+
+```bash
+# Add to your shell profile (~/.bashrc, ~/.zshrc, etc.)
+export PATH="$PATH:$HOME/go/bin"
+```
+
+Then reload your shell or run `source ~/.bashrc` (or equivalent).
+
+**Verify installation:**
+
+```bash
+which torrent-tui
+torrent-tui --version
+```
+
 ### From Source
 
 ```bash

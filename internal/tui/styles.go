@@ -5,6 +5,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/litescript/ls-torrent-tui/internal/theme"
+	"github.com/mattn/go-runewidth"
 )
 
 // GetStyles returns current themed styles
@@ -48,31 +49,33 @@ func repeat(s string, n int) string {
 	return result
 }
 
-// TruncateString truncates a string to max length with ellipsis
+// TruncateString truncates a string to max display width with ellipsis
 func TruncateString(s string, max int) string {
-	if len(s) <= max {
+	if runewidth.StringWidth(s) <= max {
 		return s
 	}
 	if max <= 3 {
-		return s[:max]
+		return runewidth.Truncate(s, max, "")
 	}
-	return s[:max-3] + "..."
+	return runewidth.Truncate(s, max-3, "") + "..."
 }
 
 // PadRight pads a string to a specific width
 func PadRight(s string, width int) string {
-	if len(s) >= width {
-		return s[:width]
+	sw := runewidth.StringWidth(s)
+	if sw >= width {
+		return runewidth.Truncate(s, width, "")
 	}
-	return s + repeat(" ", width-len(s))
+	return s + repeat(" ", width-sw)
 }
 
 // PadLeft pads a string on the left to a specific width
 func PadLeft(s string, width int) string {
-	if len(s) >= width {
-		return s[:width]
+	sw := runewidth.StringWidth(s)
+	if sw >= width {
+		return runewidth.Truncate(s, width, "")
 	}
-	return repeat(" ", width-len(s)) + s
+	return repeat(" ", width-sw) + s
 }
 
 // formatSize formats bytes to human readable size

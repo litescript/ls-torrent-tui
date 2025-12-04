@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -23,11 +24,22 @@ type GenericScraper struct {
 
 // NewGenericScraper creates a scraper for an arbitrary torrent site
 func NewGenericScraper(name, baseURL string) *GenericScraper {
+	// Create a cookie jar for session persistence
+	jar, _ := cookiejar.New(nil)
+
+	// Parse URL to get base domain for search patterns
+	cleanBase := strings.TrimRight(baseURL, "/")
+	baseDomain := cleanBase
+	if parsed, err := url.Parse(cleanBase); err == nil && parsed.Host != "" {
+		baseDomain = parsed.Scheme + "://" + parsed.Host
+	}
+
 	return &GenericScraper{
-		name:    name,
-		baseURL: strings.TrimRight(baseURL, "/"),
+		name:       name,
+		baseURL:    baseDomain, // Use domain for search patterns
 		client: &http.Client{
 			Timeout: 15 * time.Second,
+			Jar:     jar,
 		},
 	}
 }
@@ -37,15 +49,33 @@ func (s *GenericScraper) Name() string {
 	return s.name
 }
 
+// setBrowserHeaders sets headers to mimic a real browser
+func setBrowserHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
+	// Note: Don't set Accept-Encoding manually - Go handles gzip automatically
+	// and setting it manually requires us to decompress the response ourselves
+	req.Header.Set("DNT", "1")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+}
+
 // Search queries the site for torrents
 func (s *GenericScraper) Search(ctx context.Context, query string) ([]Torrent, error) {
 	// Try common search URL patterns
+	// Note: /?s= is WordPress-style but causes false positives on some sites
 	searchPatterns := []string{
+		s.baseURL + "/search/all/" + url.PathEscape(query) + "/",
 		s.baseURL + "/search/" + url.PathEscape(query) + "/",
 		s.baseURL + "/search/" + url.PathEscape(query),
 		s.baseURL + "/search?q=" + url.QueryEscape(query),
-		s.baseURL + "/?s=" + url.QueryEscape(query),
 		s.baseURL + "/torrents/?search=" + url.QueryEscape(query),
+		s.baseURL + "/q/" + url.PathEscape(query) + "/",
 	}
 
 	// If we've discovered a working search URL, use it first
@@ -80,8 +110,7 @@ func (s *GenericScraper) trySearch(ctx context.Context, searchURL string) ([]Tor
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	setBrowserHeaders(req)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -199,32 +228,69 @@ func (s *GenericScraper) extractFromTables(doc *goquery.Document) []Torrent {
 			}
 
 			t := Torrent{Source: s.name}
-			text := row.Text()
 
-			// Look for links
+			// Look for links - prefer links with actual text for name
 			row.Find("a").Each(func(k int, link *goquery.Selection) {
 				href, _ := link.Attr("href")
+				linkText := strings.TrimSpace(link.Text())
+
 				if strings.HasPrefix(href, "magnet:") {
 					t.Magnet = href
 					if t.Name == "" {
 						t.Name = extractMagnetName(href)
 					}
-				} else if t.InfoURL == "" && strings.Contains(href, "torrent") {
-					if !strings.HasPrefix(href, "http") {
-						t.InfoURL = s.baseURL + href
-					} else {
-						t.InfoURL = href
+				} else if strings.Contains(href, "torrent") || strings.Contains(href, "download") {
+					// Skip direct .torrent file downloads (like itorrents.net) - prefer detail pages
+					if strings.Contains(href, "itorrents.net") || strings.HasSuffix(href, ".torrent") {
+						return
 					}
-					if t.Name == "" && link.Text() != "" {
-						t.Name = strings.TrimSpace(link.Text())
+					// Skip external links (ads/promotions) - only consider same-site links
+					if strings.HasPrefix(href, "http") && !strings.Contains(href, s.baseURL) {
+						return
+					}
+					// This is likely a detail page link
+					if t.InfoURL == "" {
+						if !strings.HasPrefix(href, "http") {
+							t.InfoURL = s.baseURL + href
+						} else {
+							t.InfoURL = href
+						}
+					}
+					// Get name from link with actual text content
+					if linkText != "" && (t.Name == "" || len(linkText) > len(t.Name)) {
+						t.Name = linkText
 					}
 				}
 			})
 
-			// Extract numbers and size from row text
-			t.Seeders = extractNumber(text, []string{"seed"})
-			t.Leechers = extractNumber(text, []string{"leech", "peer"})
-			t.Size = extractSize(text)
+			// Extract seed/leech from cells with class names (common pattern)
+			row.Find("td").Each(func(k int, cell *goquery.Selection) {
+				class, _ := cell.Attr("class")
+				cellText := strings.TrimSpace(cell.Text())
+				cellText = strings.ReplaceAll(cellText, ",", "") // Remove commas from numbers
+
+				if strings.Contains(class, "seed") {
+					if num := parseNumber(cellText); num > 0 {
+						t.Seeders = num
+					}
+				} else if strings.Contains(class, "leech") {
+					if num := parseNumber(cellText); num > 0 {
+						t.Leechers = num
+					}
+				} else if t.Size == "" && (strings.Contains(cellText, "GB") || strings.Contains(cellText, "MB") || strings.Contains(cellText, "KB")) {
+					t.Size = cellText
+				}
+			})
+
+			// Fallback: extract from row text if cells didn't work
+			if t.Seeders == 0 && t.Leechers == 0 {
+				text := row.Text()
+				t.Seeders = extractNumber(text, []string{"seed"})
+				t.Leechers = extractNumber(text, []string{"leech", "peer"})
+				if t.Size == "" {
+					t.Size = extractSize(text)
+				}
+			}
 
 			if t.Name != "" && (t.Magnet != "" || t.InfoURL != "") {
 				results = append(results, t)
@@ -233,6 +299,15 @@ func (s *GenericScraper) extractFromTables(doc *goquery.Document) []Torrent {
 	})
 
 	return results
+}
+
+// parseNumber extracts a number from text
+func parseNumber(text string) int {
+	text = strings.TrimSpace(text)
+	text = strings.ReplaceAll(text, ",", "")
+	var num int
+	fmt.Sscanf(text, "%d", &num)
+	return num
 }
 
 // GetFiles fetches additional info from torrent detail page
@@ -245,7 +320,7 @@ func (s *GenericScraper) GetFiles(ctx context.Context, t *Torrent) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0")
+	setBrowserHeaders(req)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -286,15 +361,17 @@ func ValidateURL(ctx context.Context, rawURL string) (string, error) {
 		return "", fmt.Errorf("URL must have a host")
 	}
 
-	normalizedURL := parsed.Scheme + "://" + parsed.Host
+	// Keep the full URL including path, just normalize trailing slash
+	normalizedURL := parsed.Scheme + "://" + parsed.Host + strings.TrimSuffix(parsed.Path, "/")
 
-	// Check reachability
-	client := &http.Client{Timeout: 10 * time.Second}
+	// Check reachability with cookie jar for sites that set cookies
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Timeout: 10 * time.Second, Jar: jar}
 	req, err := http.NewRequestWithContext(ctx, "GET", normalizedURL, nil)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0")
+	setBrowserHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -312,15 +389,19 @@ func ValidateURL(ctx context.Context, rawURL string) (string, error) {
 		return "", fmt.Errorf("couldn't parse page: %w", err)
 	}
 
-	// Look for torrent indicators
+	// Look for torrent indicators - be lenient since homepages vary widely
 	pageText := strings.ToLower(doc.Text())
 	hasMagnet := doc.Find("a[href^='magnet:']").Length() > 0
-	hasSearch := doc.Find("input[type='search'], input[name='q'], input[name='search'], form[action*='search']").Length() > 0
+	hasSearch := doc.Find("input[type='search'], input[type='text'], input[name='q'], input[name='search'], form[action*='search'], form").Length() > 0
 	hasTorrentWords := strings.Contains(pageText, "torrent") ||
 		strings.Contains(pageText, "magnet") ||
 		strings.Contains(pageText, "seeders") ||
-		strings.Contains(pageText, "leechers")
+		strings.Contains(pageText, "leechers") ||
+		strings.Contains(pageText, "download") ||
+		strings.Contains(pageText, "peers") ||
+		strings.Contains(pageText, "uploaded")
 
+	// Accept if any indicator is present - homepages often don't show magnets
 	if !hasMagnet && !hasSearch && !hasTorrentWords {
 		return "", fmt.Errorf("doesn't look like a torrent site")
 	}
@@ -328,9 +409,92 @@ func ValidateURL(ctx context.Context, rawURL string) (string, error) {
 	return normalizedURL, nil
 }
 
+// discoverSearchPattern tries to find search URL pattern from a page
+func discoverSearchPattern(ctx context.Context, pageURL string) string {
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Timeout: 10 * time.Second, Jar: jar}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", pageURL, nil)
+	if err != nil {
+		return ""
+	}
+	setBrowserHeaders(req)
+
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode >= 400 {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return ""
+	}
+
+	// Parse base URL for building absolute URLs
+	parsed, _ := url.Parse(pageURL)
+	baseHost := parsed.Scheme + "://" + parsed.Host
+
+	// Look for search forms and extract action URL
+	var discoveredPattern string
+	doc.Find("form").Each(func(i int, form *goquery.Selection) {
+		if discoveredPattern != "" {
+			return // Already found one
+		}
+
+		action, _ := form.Attr("action")
+		method, _ := form.Attr("method")
+
+		// Skip POST forms - we only support GET
+		if strings.ToLower(method) == "post" {
+			return
+		}
+
+		// Check if this looks like a search form
+		isSearchForm := strings.Contains(strings.ToLower(action), "search") ||
+			form.Find("input[name='q'], input[name='search'], input[name='query']").Length() > 0
+
+		if !isSearchForm {
+			return
+		}
+
+		// Build the search URL pattern
+		if action != "" {
+			// Make absolute URL
+			if strings.HasPrefix(action, "/") {
+				action = baseHost + action
+			} else if !strings.HasPrefix(action, "http") {
+				action = baseHost + "/" + action
+			}
+
+			// Find the search input name
+			inputName := "q" // default
+			form.Find("input[type='text'], input[type='search']").Each(func(j int, input *goquery.Selection) {
+				if name, exists := input.Attr("name"); exists {
+					inputName = name
+				}
+			})
+
+			// Create pattern with %s placeholder
+			if strings.Contains(action, "?") {
+				discoveredPattern = action + "&" + inputName + "=%s"
+			} else {
+				discoveredPattern = action + "?" + inputName + "=%s"
+			}
+		}
+	})
+
+	return discoveredPattern
+}
+
 // TestSearch performs a test search to verify the site works
 func TestSearch(ctx context.Context, baseURL string) (int, error) {
 	scraper := NewGenericScraper("test", baseURL)
+
+	// Try to discover search pattern from the page first
+	if pattern := discoverSearchPattern(ctx, baseURL); pattern != "" {
+		scraper.searchURL = pattern
+	}
 
 	// Try a common search term
 	results, err := scraper.Search(ctx, "test")

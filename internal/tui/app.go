@@ -138,6 +138,7 @@ type urlValidateMsg struct {
 	name    string
 	scraper scraper.Scraper
 	err     error
+	warning string
 }
 
 type torrentListMsg struct {
@@ -346,7 +347,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Builtin: false,
 			})
 			m.saveSources()
-			m.statusMsg = fmt.Sprintf("Added source: %s", msg.name)
+			m.statusMsg = fmt.Sprintf("Added source: %s%s", msg.name, msg.warning)
 		}
 
 	case torrentListMsg:
@@ -839,23 +840,23 @@ func (m Model) validateURL(rawURL string) tea.Cmd {
 			return urlValidateMsg{url: rawURL, err: err}
 		}
 
-		// Test search to verify it works
+		// Test search to verify it works - non-fatal, just warn
+		var warning string
 		resultCount, err := scraper.TestSearch(ctx, normalizedURL)
 		if err != nil {
-			return urlValidateMsg{url: normalizedURL, err: fmt.Errorf("test search failed: %w", err)}
+			warning = " (search may not work)"
+		} else if resultCount == 0 {
+			warning = " (search may not work - no test results)"
 		}
 
-		if resultCount == 0 {
-			return urlValidateMsg{url: normalizedURL, err: fmt.Errorf("no results from test search")}
-		}
-
-		// Create a working scraper
+		// Create scraper regardless - let user try it
 		s := scraper.NewGenericScraper(normalizedURL, normalizedURL)
 
 		return urlValidateMsg{
 			url:     normalizedURL,
 			name:    normalizedURL,
 			scraper: s,
+			warning: warning,
 		}
 	}
 }
@@ -1142,7 +1143,7 @@ func (m Model) renderLogo() string {
 	tagline := "  Search torrents across multiple sources"
 	b.WriteString(styles.Muted.Render(tagline))
 	b.WriteString("\n")
-	copyright := fmt.Sprintf("  (c) 2025 litescript.net | v%s", version.Version)
+	copyright := fmt.Sprintf("  (c) 2025 litescript.net | v%s | [u]check update", version.Version)
 	b.WriteString(styles.Muted.Render(copyright))
 	b.WriteString("\n\n")
 

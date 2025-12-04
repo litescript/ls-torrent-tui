@@ -93,9 +93,10 @@ type Model struct {
 	// Search sources
 	sources       []SearchSource
 	srcCursor     int
-	addingURL     bool // Are we adding a URL?
-	validatingURL bool // Are we validating a URL?
-	urlInput      textinput.Model
+	addingURL      bool // Are we adding a URL?
+	validatingURL  bool // Are we validating a URL?
+	validationDot  int  // Animation state for validation dots (0-2)
+	urlInput       textinput.Model
 
 	// Dimensions
 	width  int
@@ -255,10 +256,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.searchInput.Width = msg.Width - 20
 
 	case spinner.TickMsg:
-		if m.searching || m.vpnConnecting {
+		if m.searching || m.vpnConnecting || m.validatingURL {
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(msg)
 			cmds = append(cmds, cmd)
+			// Cycle validation dots for animation
+			if m.validatingURL {
+				m.validationDot = (m.validationDot + 1) % 3
+			}
 		}
 
 	case searchResultMsg:
@@ -318,6 +323,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case filesLoadedMsg:
 		if msg.err != nil {
 			m.statusMsg = fmt.Sprintf("Error loading files: %v", msg.err)
+		} else if msg.index < len(m.results) && len(m.results[msg.index].Files) > 0 {
+			m.statusMsg = fmt.Sprintf("Loaded %d files", len(m.results[msg.index].Files))
+		} else {
+			m.statusMsg = "No file details available"
 		}
 
 	case torrentAddedMsg:
@@ -719,7 +728,9 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "d": // Details - load files for selected torrent
-		if m.activeTab == tabSearch && m.mode == viewResults && len(m.results) > 0 {
+		if m.activeTab == tabSearch && (m.mode == viewResults || m.mode == viewDetails) && len(m.results) > 0 {
+			m.mode = viewDetails
+			m.statusMsg = "Loading file details..."
 			return m, m.loadFiles()
 		}
 		return m, handled()
@@ -1576,7 +1587,19 @@ func (m Model) renderSourcesTab(height int) string {
 	var b strings.Builder
 
 	// Title and add URL input
-	if m.addingURL {
+	if m.validatingURL {
+		// Show animated dots during validation
+		dots := [3]string{".", ".", "."}
+		for i := 0; i < 3; i++ {
+			if i == m.validationDot {
+				dots[i] = styles.Title.Render(".")
+			} else {
+				dots[i] = styles.Muted.Render(".")
+			}
+		}
+		b.WriteString(styles.SearchPrompt.Render("Validating") + dots[0] + dots[1] + dots[2])
+		b.WriteString("\n\n")
+	} else if m.addingURL {
 		prompt := styles.SearchPrompt.Render("Add URL: ")
 		b.WriteString(prompt + m.urlInput.View())
 		b.WriteString("\n\n")
@@ -1637,24 +1660,25 @@ func (m Model) renderSourcesTab(height int) string {
 		}
 		name = TruncateString(name, nameWidth-2)
 
-		var status, statusStyle string
+		var status string
+		var statusStyled string
 		if src.Warning != "" {
 			status = "Warning"
-			statusStyle = styles.HealthMed.Render(status)
+			statusStyled = styles.HealthMed.Render(PadLeft(status, statusWidth))
 		} else if src.Enabled {
 			status = "Enabled"
-			statusStyle = styles.VPNConnected.Render(status)
+			statusStyled = styles.VPNConnected.Render(PadLeft(status, statusWidth))
 		} else {
 			status = "Disabled"
-			statusStyle = styles.Muted.Render(status)
+			statusStyled = styles.Muted.Render(PadLeft(status, statusWidth))
 		}
 
-		statusPadded := PadLeft(statusStyle, statusWidth+len(statusStyle)-len(status)) // Account for ANSI codes
-
+		// Build row: prefix + padded name + space + styled status
+		namePadded := PadRight(name, nameWidth)
 		if i == m.srcCursor {
-			b.WriteString(styles.TableSelected.Render("› "+PadRight(name, nameWidth)) + " " + statusPadded)
+			b.WriteString(styles.TableSelected.Render("› " + namePadded + " ") + statusStyled)
 		} else {
-			b.WriteString(styles.TableRow.Render("  "+PadRight(name, nameWidth)) + " " + statusPadded)
+			b.WriteString(styles.TableRow.Render("  " + namePadded + " ") + statusStyled)
 		}
 		b.WriteString("\n")
 	}

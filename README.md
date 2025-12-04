@@ -4,6 +4,23 @@ A terminal user interface for managing qBittorrent and organizing torrent downlo
 
 This is a **client and management interface** for qBittorrent—it helps you monitor, control, and organize your existing torrents through a clean terminal UI. It does not provide or index any content.
 
+## Screenshots
+
+<p align="center">
+  <img src="assets/screenshot-search.png" alt="Search Interface" width="700">
+  <br><em>Main search interface with tab navigation</em>
+</p>
+
+<p align="center">
+  <img src="assets/screenshot-results.png" alt="Search Results" width="700">
+  <br><em>Search results with health indicators and sorting</em>
+</p>
+
+<p align="center">
+  <img src="assets/screenshot-settings.png" alt="Settings Modal" width="700">
+  <br><em>In-app settings configuration</em>
+</p>
+
 ## What This Project Is *Not*
 
 - Not a torrent indexer

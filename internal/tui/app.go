@@ -82,13 +82,20 @@ type Model struct {
 	downloading []qbit.TorrentInfo
 	completed   []qbit.TorrentInfo
 
-	// Sorting (downloads/completed tabs)
-	sortCol int  // 0=name, 1=size, 2=done, 3=dl, 4=ul, 5=eta
-	sortAsc bool // true=ascending, false=descending
+	// Sorting (downloads tab): 0=name, 1=size, 2=done, 3=dl, 4=ul, 5=eta
+	dlSortCol int
+	dlSortAsc bool
 
-	// Search results sorting
-	searchSortCol int  // 0=name, 1=size, 2=seeds, 3=leech, 4=health
-	searchSortAsc bool // true=ascending, false=descending
+	// Sorting (completed tab): 0=name, 1=size, 2=ratio, 3=uploaded
+	compSortCol int
+	compSortAsc bool
+
+	// Search results sorting: 0=name, 1=size, 2=seeds, 3=leech, 4=health
+	searchSortCol int
+	searchSortAsc bool
+
+	// Track which results have been sent to download (by name, since indices change with sort)
+	downloaded map[string]bool
 
 	// Search sources
 	sources       []SearchSource
@@ -97,6 +104,7 @@ type Model struct {
 	validatingURL  bool // Are we validating a URL?
 	validationDot  int  // Animation state for validation dots (0-2)
 	urlInput       textinput.Model
+	confirmingQuit bool // Are we showing the quit confirmation modal?
 
 	// Dimensions
 	width  int
@@ -194,6 +202,7 @@ func NewModel(cfg config.Config) Model {
 			Enabled: src.Enabled,
 			Scraper: scraper.NewGenericScraper(src.Name, src.URL),
 			Builtin: false,
+			Warning: src.Warning,
 		})
 	}
 
@@ -207,14 +216,21 @@ func NewModel(cfg config.Config) Model {
 	vpnChecker := vpn.NewChecker(cfg.VPN.StatusScript, cfg.VPN.ConnectScript)
 
 	return Model{
-		cfg:         cfg,
-		searchInput: ti,
-		spinner:     sp,
-		urlInput:    urlIn,
-		mode:        viewSearch,
-		sources:     sources,
-		qbitClient:  qbitClient,
-		vpnChecker:  vpnChecker,
+		cfg:           cfg,
+		searchInput:   ti,
+		spinner:       sp,
+		urlInput:      urlIn,
+		mode:          viewSearch,
+		sources:       sources,
+		qbitClient:    qbitClient,
+		vpnChecker:    vpnChecker,
+		searchSortCol: cfg.Sort.SearchCol,
+		searchSortAsc: cfg.Sort.SearchAsc,
+		dlSortCol:     cfg.Sort.DownloadsCol,
+		dlSortAsc:     cfg.Sort.DownloadsAsc,
+		compSortCol:   cfg.Sort.CompletedCol,
+		compSortAsc:   cfg.Sort.CompletedAsc,
+		downloaded:    make(map[string]bool),
 	}
 }
 
@@ -276,9 +292,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.results = nil
 		} else {
 			m.results = msg.results
+			// Apply current sort settings to new results
+			sortSearchResults(m.results, m.searchSortCol, m.searchSortAsc)
 			m.cursor = 0
 			m.mode = viewResults
 			m.statusMsg = fmt.Sprintf("Found %d results", len(m.results))
+			// Clear downloaded indicators for new search
+			m.downloaded = make(map[string]bool)
 		}
 
 	case vpnStatusMsg:
@@ -323,10 +343,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case filesLoadedMsg:
 		if msg.err != nil {
 			m.statusMsg = fmt.Sprintf("Error loading files: %v", msg.err)
+			m.mode = viewResults // Reset to results mode on error
 		} else if msg.index < len(m.results) && len(m.results[msg.index].Files) > 0 {
 			m.statusMsg = fmt.Sprintf("Loaded %d files", len(m.results[msg.index].Files))
 		} else {
 			m.statusMsg = "No file details available"
+			m.mode = viewResults // Reset to results mode when no details
 		}
 
 	case torrentAddedMsg:
@@ -334,6 +356,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = fmt.Sprintf("Error: %v", msg.err)
 		} else {
 			m.statusMsg = fmt.Sprintf("Added: %s", TruncateString(msg.name, 40))
+			// Mark as downloaded so we can show indicator in results
+			m.downloaded[msg.name] = true
 		}
 
 	case vpnConnectMsg:
@@ -369,6 +393,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err == nil {
 			m.downloading = msg.downloading
 			m.completed = msg.completed
+			// Apply current sort settings
+			sortTorrents(m.downloading, m.dlSortCol, m.dlSortAsc)
+			sortCompletedTorrents(m.completed, m.compSortCol, m.compSortAsc)
 		}
 
 	case tickMsg:
@@ -431,6 +458,20 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, handled()
 	}
 
+	// Handle quit confirmation modal
+	if m.confirmingQuit {
+		switch key {
+		case "q", "y", "enter":
+			return m, tea.Quit
+		case "ctrl+c":
+			return m, tea.Quit
+		default:
+			// Any other key cancels
+			m.confirmingQuit = false
+			return m, handled()
+		}
+	}
+
 	// When adding URL in sources tab
 	if m.addingURL && m.urlInput.Focused() {
 		switch key {
@@ -487,6 +528,15 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch key {
 		case "ctrl+c":
 			return m, tea.Quit
+		case "ctrl+u":
+			// Clear search input and results
+			m.searchInput.SetValue("")
+			m.results = nil
+			m.cursor = 0
+			m.mode = viewSearch
+			m.statusMsg = ""
+			m.downloaded = make(map[string]bool)
+			return m, handled()
 		case "alt+1":
 			m.activeTab = tabSearch
 			// Preserve results view if we have results
@@ -567,12 +617,11 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Search input NOT focused (CMD MODE) - handle navigation keys
 	switch key {
-	case "ctrl+c", "q":
-		if m.activeTab == tabSearch && m.mode == viewSearch {
-			return m, tea.Quit
-		}
-		m.activeTab = tabSearch
-		m.mode = viewSearch
+	case "ctrl+c":
+		return m, tea.Quit
+	case "q":
+		// Show quit confirmation modal
+		m.confirmingQuit = true
 		return m, handled()
 
 	case "esc":
@@ -603,7 +652,7 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "up", "k":
 		switch m.activeTab {
 		case tabSearch:
-			if m.mode == viewResults && m.cursor > 0 {
+			if (m.mode == viewResults || m.mode == viewDetails) && m.cursor > 0 {
 				m.cursor--
 			}
 		case tabDownloads:
@@ -624,7 +673,7 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		switch m.activeTab {
 		case tabSearch:
-			if m.mode == viewResults && m.cursor < len(m.results)-1 {
+			if (m.mode == viewResults || m.mode == viewDetails) && m.cursor < len(m.results)-1 {
 				m.cursor++
 			}
 		case tabDownloads:
@@ -644,65 +693,87 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "left", "h":
 		// Navigate sort columns
-		if m.activeTab == tabSearch && m.mode == viewResults {
+		if m.activeTab == tabSearch && (m.mode == viewResults || m.mode == viewDetails) {
 			if m.searchSortCol > 0 {
 				m.searchSortCol--
 			} else {
 				m.searchSortCol = 4 // Wrap to last column (5 columns)
 			}
+			sortSearchResults(m.results, m.searchSortCol, m.searchSortAsc)
+			m.saveSortSettings()
 			return m, handled()
 		}
 		if m.activeTab == tabDownloads {
-			if m.sortCol > 0 {
-				m.sortCol--
+			if m.dlSortCol > 0 {
+				m.dlSortCol--
 			} else {
-				m.sortCol = 5 // Wrap to last column (6 columns)
+				m.dlSortCol = 5 // Wrap to last column (6 columns)
 			}
+			sortTorrents(m.downloading, m.dlSortCol, m.dlSortAsc)
+			m.saveSortSettings()
 			return m, handled()
 		}
 		if m.activeTab == tabCompleted {
-			if m.sortCol > 0 {
-				m.sortCol--
+			if m.compSortCol > 0 {
+				m.compSortCol--
 			} else {
-				m.sortCol = 3 // Wrap to last column (4 columns)
+				m.compSortCol = 3 // Wrap to last column (4 columns)
 			}
+			sortCompletedTorrents(m.completed, m.compSortCol, m.compSortAsc)
+			m.saveSortSettings()
 			return m, handled()
 		}
 
 	case "right", "l":
 		// Navigate sort columns
-		if m.activeTab == tabSearch && m.mode == viewResults {
+		if m.activeTab == tabSearch && (m.mode == viewResults || m.mode == viewDetails) {
 			if m.searchSortCol < 4 {
 				m.searchSortCol++
 			} else {
 				m.searchSortCol = 0 // Wrap to first column
 			}
+			sortSearchResults(m.results, m.searchSortCol, m.searchSortAsc)
+			m.saveSortSettings()
 			return m, handled()
 		}
 		if m.activeTab == tabDownloads {
-			if m.sortCol < 5 {
-				m.sortCol++
+			if m.dlSortCol < 5 {
+				m.dlSortCol++
 			} else {
-				m.sortCol = 0 // Wrap to first column
+				m.dlSortCol = 0 // Wrap to first column
 			}
+			sortTorrents(m.downloading, m.dlSortCol, m.dlSortAsc)
+			m.saveSortSettings()
 			return m, handled()
 		}
 		if m.activeTab == tabCompleted {
-			if m.sortCol < 3 {
-				m.sortCol++
+			if m.compSortCol < 3 {
+				m.compSortCol++
 			} else {
-				m.sortCol = 0 // Wrap to first column
+				m.compSortCol = 0 // Wrap to first column
 			}
+			sortCompletedTorrents(m.completed, m.compSortCol, m.compSortAsc)
+			m.saveSortSettings()
 			return m, handled()
 		}
 
 	case "s": // Toggle sort direction
-		if m.activeTab == tabSearch && m.mode == viewResults {
+		if m.activeTab == tabSearch && (m.mode == viewResults || m.mode == viewDetails) {
 			m.searchSortAsc = !m.searchSortAsc
+			sortSearchResults(m.results, m.searchSortCol, m.searchSortAsc)
+			m.saveSortSettings()
 			return m, handled()
 		}
-		if m.activeTab == tabDownloads || m.activeTab == tabCompleted {
-			m.sortAsc = !m.sortAsc
+		if m.activeTab == tabDownloads {
+			m.dlSortAsc = !m.dlSortAsc
+			sortTorrents(m.downloading, m.dlSortCol, m.dlSortAsc)
+			m.saveSortSettings()
+			return m, handled()
+		}
+		if m.activeTab == tabCompleted {
+			m.compSortAsc = !m.compSortAsc
+			sortCompletedTorrents(m.completed, m.compSortCol, m.compSortAsc)
+			m.saveSortSettings()
 			return m, handled()
 		}
 
@@ -800,10 +871,13 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.statusMsg = "Checking for updates..."
 		return m, checkForUpdate()
 
-	case "/", "i": // / or i to focus search
+	case "/", "i": // / or i to focus search input (preserves results)
 		m.activeTab = tabSearch
-		m.mode = viewSearch
 		m.searchInput.Focus()
+		// Keep results visible if we have them, but allow editing query
+		if len(m.results) == 0 {
+			m.mode = viewSearch
+		}
 		return m, handled()
 
 	case "tab":
@@ -841,10 +915,17 @@ func (m Model) doSearch() tea.Cmd {
 			allResults = append(allResults, results...)
 		}
 
-		// Sort by health (best first)
-		sort.Slice(allResults, func(i, j int) bool {
-			return allResults[i].Health() > allResults[j].Health()
-		})
+		// Filter out obvious garbage (no seeds, no leechers, no size = sidebar/ad links)
+		filtered := make([]scraper.Torrent, 0, len(allResults))
+		for _, t := range allResults {
+			// Keep if has any activity or size info
+			if t.Seeders > 0 || t.Leechers > 0 || t.Size != "" {
+				filtered = append(filtered, t)
+			}
+		}
+		allResults = filtered
+
+		// Sorting is applied in searchResultMsg handler using user's sort settings
 
 		if len(allResults) == 0 && lastErr != nil {
 			return searchResultMsg{err: lastErr}
@@ -917,10 +998,22 @@ func (m Model) saveSources() {
 				Name:    src.Name,
 				URL:     src.URL,
 				Enabled: src.Enabled,
+				Warning: src.Warning,
 			})
 		}
 	}
 	m.cfg.Sources = customSources
+	_ = config.Save(m.cfg) // Ignore error, it's just persistence
+}
+
+// saveSortSettings saves sort preferences to config
+func (m Model) saveSortSettings() {
+	m.cfg.Sort.SearchCol = m.searchSortCol
+	m.cfg.Sort.SearchAsc = m.searchSortAsc
+	m.cfg.Sort.DownloadsCol = m.dlSortCol
+	m.cfg.Sort.DownloadsAsc = m.dlSortAsc
+	m.cfg.Sort.CompletedCol = m.compSortCol
+	m.cfg.Sort.CompletedAsc = m.compSortAsc
 	_ = config.Save(m.cfg) // Ignore error, it's just persistence
 }
 
@@ -1149,6 +1242,19 @@ func (m Model) View() string {
 		}
 	}
 
+	// Quit confirmation modal overlay
+	if m.confirmingQuit {
+		b.WriteString("\n\n")
+		modalStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color(theme.CurrentPalette.Accent)).
+			Padding(1, 3)
+		modalContent := styles.Title.Render("Quit?") + "\n\n" +
+			styles.Muted.Render("Press ") + styles.HelpKey.Render("q") + styles.Muted.Render(" or ") +
+			styles.HelpKey.Render("enter") + styles.Muted.Render(" to quit, any other key to cancel")
+		b.WriteString(modalStyle.Render(modalContent))
+	}
+
 	return b.String()
 }
 
@@ -1373,33 +1479,34 @@ func (m Model) renderDownloadsTab(height int) string {
 	for i, name := range colNames {
 		w := colWidths[i]
 		ind := " "
-		if i == m.sortCol {
-			if m.sortAsc {
+		if i == m.dlSortCol {
+			if m.dlSortAsc {
 				ind = "▲"
 			} else {
 				ind = "▼"
 			}
 		}
-		// Build column text - indicator right after name, padded to full width
-		// Note: unicode arrows are 3 bytes but 1 display char, so calculate padding manually
+		// Build column text
+		// NAME (col 0): left-align, arrow after name
+		// Others: right-align, arrow prepended
 		var colText string
-		if i == len(colNames)-1 {
-			// Last column (ETA): right-align, indicator prepended
-			padding := w - len(name) - 1
-			if padding < 0 {
-				padding = 0
-			}
-			colText = repeat(" ", padding) + ind + name
-		} else {
-			// Others: left-align, indicator right after name
+		if i == 0 {
+			// NAME: left-align, indicator right after name
 			padding := w - len(name) - 1
 			if padding < 0 {
 				padding = 0
 			}
 			colText = name + ind + repeat(" ", padding)
+		} else {
+			// Others: right-align, indicator prepended
+			padding := w - len(name) - 1
+			if padding < 0 {
+				padding = 0
+			}
+			colText = repeat(" ", padding) + ind + name
 		}
 		// Apply style - sorted column highlighted, others muted
-		if i == m.sortCol {
+		if i == m.dlSortCol {
 			headerParts = append(headerParts, styles.SortedHeader.Render(colText))
 		} else {
 			headerParts = append(headerParts, styles.Muted.Render(colText))
@@ -1416,10 +1523,7 @@ func (m Model) renderDownloadsTab(height int) string {
 	b.WriteString(headerStyle.Render(header))
 	b.WriteString("\n")
 
-	// Sort torrents
-	sorted := make([]qbit.TorrentInfo, len(m.downloading))
-	copy(sorted, m.downloading)
-	sortTorrents(sorted, m.sortCol, m.sortAsc)
+	// Torrents are already sorted in-place when sort changes or list refreshes
 
 	// Rows
 	visibleRows := height - 2
@@ -1433,12 +1537,12 @@ func (m Model) renderDownloadsTab(height int) string {
 	}
 
 	endIdx := startIdx + visibleRows
-	if endIdx > len(sorted) {
-		endIdx = len(sorted)
+	if endIdx > len(m.downloading) {
+		endIdx = len(m.downloading)
 	}
 
 	for i := startIdx; i < endIdx; i++ {
-		t := sorted[i]
+		t := m.downloading[i]
 		name := TruncateString(t.Name, nameWidth-2) // -2 for "› " prefix
 		progress := fmt.Sprintf("%.1f%%", t.Progress*100)
 		dlSpeed := formatSpeed(t.DLSpeed)
@@ -1492,33 +1596,34 @@ func (m Model) renderCompletedTab(height int) string {
 	for i, name := range colNames {
 		w := colWidths[i]
 		ind := " "
-		if i == m.sortCol {
-			if m.sortAsc {
+		if i == m.compSortCol {
+			if m.compSortAsc {
 				ind = "▲"
 			} else {
 				ind = "▼"
 			}
 		}
-		// Build column text - indicator right after name, padded to full width
-		// Note: unicode arrows are 3 bytes but 1 display char, so calculate padding manually
+		// Build column text
+		// NAME (col 0): left-align, arrow after name
+		// Others: right-align, arrow prepended
 		var colText string
-		if i == len(colNames)-1 {
-			// Last column: right-align, indicator prepended
-			padding := w - len(name) - 1
-			if padding < 0 {
-				padding = 0
-			}
-			colText = repeat(" ", padding) + ind + name
-		} else {
-			// Others: left-align, indicator right after name
+		if i == 0 {
+			// NAME: left-align, indicator right after name
 			padding := w - len(name) - 1
 			if padding < 0 {
 				padding = 0
 			}
 			colText = name + ind + repeat(" ", padding)
+		} else {
+			// Others: right-align, indicator prepended
+			padding := w - len(name) - 1
+			if padding < 0 {
+				padding = 0
+			}
+			colText = repeat(" ", padding) + ind + name
 		}
 		// Apply style - sorted column highlighted, others muted
-		if i == m.sortCol {
+		if i == m.compSortCol {
 			headerParts = append(headerParts, styles.SortedHeader.Render(colText))
 		} else {
 			headerParts = append(headerParts, styles.Muted.Render(colText))
@@ -1535,10 +1640,7 @@ func (m Model) renderCompletedTab(height int) string {
 	b.WriteString(headerStyle.Render(header))
 	b.WriteString("\n")
 
-	// Sort torrents
-	sorted := make([]qbit.TorrentInfo, len(m.completed))
-	copy(sorted, m.completed)
-	sortCompletedTorrents(sorted, m.sortCol, m.sortAsc)
+	// Torrents are already sorted in-place when sort changes or list refreshes
 
 	// Rows
 	visibleRows := height - 2
@@ -1552,12 +1654,12 @@ func (m Model) renderCompletedTab(height int) string {
 	}
 
 	endIdx := startIdx + visibleRows
-	if endIdx > len(sorted) {
-		endIdx = len(sorted)
+	if endIdx > len(m.completed) {
+		endIdx = len(m.completed)
 	}
 
 	for i := startIdx; i < endIdx; i++ {
-		t := sorted[i]
+		t := m.completed[i]
 		name := TruncateString(t.Name, nameWidth-2) // -2 for "› " prefix
 		size := formatSize(t.Size)
 		ratio := fmt.Sprintf("%.2f", float64(t.UploadedEver)/float64(t.Size))
@@ -1662,15 +1764,15 @@ func (m Model) renderSourcesTab(height int) string {
 
 		var status string
 		var statusStyled string
-		if src.Warning != "" {
-			status = "Warning"
-			statusStyled = styles.HealthMed.Render(PadLeft(status, statusWidth))
-		} else if src.Enabled {
-			status = "Enabled"
-			statusStyled = styles.VPNConnected.Render(PadLeft(status, statusWidth))
-		} else {
+		if !src.Enabled {
 			status = "Disabled"
 			statusStyled = styles.Muted.Render(PadLeft(status, statusWidth))
+		} else if src.Warning != "" {
+			status = "Warning"
+			statusStyled = styles.HealthMed.Render(PadLeft(status, statusWidth))
+		} else {
+			status = "Enabled"
+			statusStyled = styles.VPNConnected.Render(PadLeft(status, statusWidth))
 		}
 
 		// Build row: prefix + padded name + space + styled status
@@ -1753,10 +1855,7 @@ func (m Model) renderResults(height int) string {
 	b.WriteString(headerStyle.Render(header))
 	b.WriteString("\n")
 
-	// Sort results
-	sorted := make([]scraper.Torrent, len(m.results))
-	copy(sorted, m.results)
-	sortSearchResults(sorted, m.searchSortCol, m.searchSortAsc)
+	// Results are already sorted in-place when sort changes
 
 	// Calculate visible range
 	visibleRows := height - 3
@@ -1770,13 +1869,13 @@ func (m Model) renderResults(height int) string {
 	}
 
 	endIdx := startIdx + visibleRows
-	if endIdx > len(sorted) {
-		endIdx = len(sorted)
+	if endIdx > len(m.results) {
+		endIdx = len(m.results)
 	}
 
 	// Render rows
 	for i := startIdx; i < endIdx; i++ {
-		t := sorted[i]
+		t := m.results[i]
 		name := TruncateString(t.Name, nameWidth-2) // -2 for "› " prefix
 
 		// Match header widths exactly
@@ -1787,10 +1886,21 @@ func (m Model) renderResults(height int) string {
 			PadLeft(fmt.Sprintf("%d", t.Leechers), 6),
 			HealthBar(t.Health(), 6))
 
+		// Check if this item has been downloaded
+		isDownloaded := m.downloaded[t.Name]
+
 		if i == m.cursor {
-			b.WriteString(styles.TableSelected.Render("› " + row))
+			if isDownloaded {
+				b.WriteString(styles.VPNConnected.Render("✓ ") + styles.TableSelected.Render(row))
+			} else {
+				b.WriteString(styles.TableSelected.Render("› " + row))
+			}
 		} else {
-			b.WriteString(styles.TableRow.Render("  " + row))
+			if isDownloaded {
+				b.WriteString(styles.VPNConnected.Render("✓ ") + styles.TableRow.Render(row))
+			} else {
+				b.WriteString(styles.TableRow.Render("  " + row))
+			}
 		}
 		b.WriteString("\n")
 	}
@@ -1849,20 +1959,20 @@ func (m Model) renderStatusBar() string {
 	// Context-sensitive help (mode + tab aware)
 	var help string
 	if m.searchInput.Focused() {
-		help = "[esc]CMD [enter]Search"
+		help = "[esc]CMD [ctrl+u]Clear [enter]Search"
 	} else if m.addingURL {
 		help = "[esc]Cancel [enter]Add"
 	} else {
 		switch m.activeTab {
 		case tabDownloads:
-			help = "[←→]Sort col [s]Toggle sort [p]Pause [x]Remove [q]Back"
+			help = "[←→]Sort col [s]Toggle sort [p]Pause [x]Remove [q]Quit"
 		case tabCompleted:
-			help = "[←→]Sort col [s]Toggle sort [m]Plex [x]Remove [q]Back"
+			help = "[←→]Sort col [s]Toggle sort [m]Plex [x]Remove [q]Quit"
 		case tabSources:
-			help = "[a]Add [enter]Toggle [x]Remove [q]Back"
+			help = "[a]Add [enter]Toggle [x]Remove [q]Quit"
 		default:
-			if m.mode == viewResults {
-				help = "[←→]Sort [s]Toggle [enter]Download [d]Details [q]Back"
+			if m.mode == viewResults || m.mode == viewDetails {
+				help = "[←→]Sort [s]Toggle [enter]Download [d]Details [esc]Back [q]Quit"
 			} else {
 				help = "[/]Search [v]VPN [q]Quit"
 			}

@@ -16,7 +16,23 @@ type Config struct {
 	VPN         VPNConfig         `toml:"vpn"`
 	Downloads   DownloadsConfig   `toml:"downloads"`
 	Plex        PlexConfig        `toml:"plex"`
+	Sort        SortConfig        `toml:"sort"`
 	Sources     []SourceConfig    `toml:"sources"`
+}
+
+// SortConfig holds user's preferred sort settings for each tab
+type SortConfig struct {
+	// Search results: 0=name, 1=size, 2=seeds, 3=leech, 4=health
+	SearchCol int  `toml:"search_col"`
+	SearchAsc bool `toml:"search_asc"`
+
+	// Downloads: 0=name, 1=size, 2=done, 3=dl, 4=ul, 5=eta
+	DownloadsCol int  `toml:"downloads_col"`
+	DownloadsAsc bool `toml:"downloads_asc"`
+
+	// Completed: 0=name, 1=size, 2=ratio, 3=uploaded
+	CompletedCol int  `toml:"completed_col"`
+	CompletedAsc bool `toml:"completed_asc"`
 }
 
 // SourceConfig holds a custom torrent source
@@ -24,6 +40,7 @@ type SourceConfig struct {
 	Name    string `toml:"name"`
 	URL     string `toml:"url"`
 	Enabled bool   `toml:"enabled"`
+	Warning string `toml:"warning,omitempty"` // Non-empty if source has issues
 }
 
 // QBittorrentConfig holds qBittorrent Web API settings
@@ -93,6 +110,14 @@ func Default() Config {
 			MovieLibrary: "", // Must be configured by user
 			TVLibrary:    "", // Must be configured by user
 			AutoDetect:   true,
+		},
+		Sort: SortConfig{
+			SearchCol:    2,     // Default: seeds (most seeders first)
+			SearchAsc:    false, // Descending (most seeds first)
+			DownloadsCol: 5,     // Default: ETA
+			DownloadsAsc: true,  // Ascending (soonest first)
+			CompletedCol: 1,     // Default: size
+			CompletedAsc: false, // Descending (largest first)
 		},
 		// Sources: nil - no search sources by default
 		// Users add their own sources via the Sources tab in the TUI

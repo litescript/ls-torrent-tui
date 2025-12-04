@@ -98,13 +98,20 @@ type Model struct {
 	downloaded map[string]bool
 
 	// Search sources
-	sources       []SearchSource
-	srcCursor     int
+	sources        []SearchSource
+	srcCursor      int
 	addingURL      bool // Are we adding a URL?
 	validatingURL  bool // Are we validating a URL?
 	validationDot  int  // Animation state for validation dots (0-2)
 	urlInput       textinput.Model
 	confirmingQuit bool // Are we showing the quit confirmation modal?
+
+	// Settings modal state
+	showSettings    bool              // Are we showing the settings modal?
+	settingsSection int               // 0=qBit, 1=Downloads, 2=VPN, 3=Plex
+	settingsField   int               // Which field is selected in current section
+	settingsEditing bool              // Are we editing a field?
+	settingsInputs  []textinput.Model // Text inputs for settings fields
 
 	// Dimensions
 	width  int
@@ -192,6 +199,29 @@ func NewModel(cfg config.Config) Model {
 	urlIn.CharLimit = 512
 	urlIn.Width = 60
 
+	// Settings inputs (9 fields total)
+	// qBit: host, port, username, password (indices 0-3)
+	// Downloads: path (index 4)
+	// VPN: status_script, connect_script (indices 5-6)
+	// Plex: movie_library, tv_library (indices 7-8)
+	settingsInputs := make([]textinput.Model, 9)
+	for i := range settingsInputs {
+		settingsInputs[i] = textinput.New()
+		settingsInputs[i].CharLimit = 256
+		settingsInputs[i].Width = 50
+	}
+	// Set initial values from config
+	settingsInputs[0].SetValue(cfg.QBittorrent.Host)
+	settingsInputs[1].SetValue(fmt.Sprintf("%d", cfg.QBittorrent.Port))
+	settingsInputs[2].SetValue(cfg.QBittorrent.Username)
+	settingsInputs[3].SetValue(cfg.QBittorrent.Password)
+	settingsInputs[3].EchoMode = textinput.EchoPassword
+	settingsInputs[4].SetValue(cfg.Downloads.Path)
+	settingsInputs[5].SetValue(cfg.VPN.StatusScript)
+	settingsInputs[6].SetValue(cfg.VPN.ConnectScript)
+	settingsInputs[7].SetValue(cfg.Plex.MovieLibrary)
+	settingsInputs[8].SetValue(cfg.Plex.TVLibrary)
+
 	// Initialize search sources from config
 	// No built-in sources - users add their own via the Sources tab
 	var sources []SearchSource
@@ -216,21 +246,22 @@ func NewModel(cfg config.Config) Model {
 	vpnChecker := vpn.NewChecker(cfg.VPN.StatusScript, cfg.VPN.ConnectScript)
 
 	return Model{
-		cfg:           cfg,
-		searchInput:   ti,
-		spinner:       sp,
-		urlInput:      urlIn,
-		mode:          viewSearch,
-		sources:       sources,
-		qbitClient:    qbitClient,
-		vpnChecker:    vpnChecker,
-		searchSortCol: cfg.Sort.SearchCol,
-		searchSortAsc: cfg.Sort.SearchAsc,
-		dlSortCol:     cfg.Sort.DownloadsCol,
-		dlSortAsc:     cfg.Sort.DownloadsAsc,
-		compSortCol:   cfg.Sort.CompletedCol,
-		compSortAsc:   cfg.Sort.CompletedAsc,
-		downloaded:    make(map[string]bool),
+		cfg:            cfg,
+		searchInput:    ti,
+		spinner:        sp,
+		urlInput:       urlIn,
+		mode:           viewSearch,
+		sources:        sources,
+		qbitClient:     qbitClient,
+		vpnChecker:     vpnChecker,
+		searchSortCol:  cfg.Sort.SearchCol,
+		searchSortAsc:  cfg.Sort.SearchAsc,
+		dlSortCol:      cfg.Sort.DownloadsCol,
+		dlSortAsc:      cfg.Sort.DownloadsAsc,
+		compSortCol:    cfg.Sort.CompletedCol,
+		compSortAsc:    cfg.Sort.CompletedAsc,
+		downloaded:     make(map[string]bool),
+		settingsInputs: settingsInputs,
 	}
 }
 
@@ -443,6 +474,11 @@ func handled() tea.Cmd {
 func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
+	// Global quit - always works
+	if key == "ctrl+c" {
+		return m, tea.Quit
+	}
+
 	// Handle VPN connect mode specially
 	if m.mode == viewVPNConnect {
 		switch key {
@@ -470,6 +506,11 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.confirmingQuit = false
 			return m, handled()
 		}
+	}
+
+	// Handle settings modal
+	if m.showSettings {
+		return m.handleSettingsKey(key)
 	}
 
 	// When adding URL in sources tab
@@ -871,6 +912,23 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.statusMsg = "Checking for updates..."
 		return m, checkForUpdate()
 
+	case "c": // Open settings modal
+		m.showSettings = true
+		m.settingsSection = 0
+		m.settingsField = 0
+		m.settingsEditing = false
+		// Refresh input values from current config
+		m.settingsInputs[0].SetValue(m.cfg.QBittorrent.Host)
+		m.settingsInputs[1].SetValue(fmt.Sprintf("%d", m.cfg.QBittorrent.Port))
+		m.settingsInputs[2].SetValue(m.cfg.QBittorrent.Username)
+		m.settingsInputs[3].SetValue(m.cfg.QBittorrent.Password)
+		m.settingsInputs[4].SetValue(m.cfg.Downloads.Path)
+		m.settingsInputs[5].SetValue(m.cfg.VPN.StatusScript)
+		m.settingsInputs[6].SetValue(m.cfg.VPN.ConnectScript)
+		m.settingsInputs[7].SetValue(m.cfg.Plex.MovieLibrary)
+		m.settingsInputs[8].SetValue(m.cfg.Plex.TVLibrary)
+		return m, handled()
+
 	case "/", "i": // / or i to focus search input (preserves results)
 		m.activeTab = tabSearch
 		m.searchInput.Focus()
@@ -1015,6 +1073,136 @@ func (m Model) saveSortSettings() {
 	m.cfg.Sort.CompletedCol = m.compSortCol
 	m.cfg.Sort.CompletedAsc = m.compSortAsc
 	_ = config.Save(m.cfg) // Ignore error, it's just persistence
+}
+
+// settingsSectionFields returns the field indices for each section
+// Section 0 (qBit): fields 0-3 (host, port, username, password)
+// Section 1 (Downloads): field 4 (path)
+// Section 2 (VPN): fields 5-6 (status_script, connect_script)
+// Section 3 (Plex): fields 7-8 (movie_library, tv_library)
+func settingsSectionFields(section int) []int {
+	switch section {
+	case 0:
+		return []int{0, 1, 2, 3}
+	case 1:
+		return []int{4}
+	case 2:
+		return []int{5, 6}
+	case 3:
+		return []int{7, 8}
+	default:
+		return []int{}
+	}
+}
+
+// handleSettingsKey handles keyboard input for the settings modal
+func (m Model) handleSettingsKey(key string) (tea.Model, tea.Cmd) {
+	fields := settingsSectionFields(m.settingsSection)
+
+	// If editing a field, handle text input
+	if m.settingsEditing {
+		fieldIdx := fields[m.settingsField]
+		switch key {
+		case "esc":
+			m.settingsEditing = false
+			m.settingsInputs[fieldIdx].Blur()
+			return m, handled()
+		case "enter":
+			m.settingsEditing = false
+			m.settingsInputs[fieldIdx].Blur()
+			return m, handled()
+		default:
+			// Let the text input handle it
+			var cmd tea.Cmd
+			m.settingsInputs[fieldIdx], cmd = m.settingsInputs[fieldIdx].Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+			return m, cmd
+		}
+	}
+
+	// Not editing - handle navigation
+	switch key {
+	case "esc", "c":
+		// Close settings without saving
+		m.showSettings = false
+		return m, handled()
+
+	case "enter":
+		// Save and close
+		m.saveSettings()
+		m.showSettings = false
+		m.statusMsg = "Settings saved"
+		return m, handled()
+
+	case "tab", "right", "l":
+		// Next section
+		m.settingsSection = (m.settingsSection + 1) % 4
+		m.settingsField = 0
+		return m, handled()
+
+	case "shift+tab", "left", "h":
+		// Previous section
+		m.settingsSection = (m.settingsSection + 3) % 4 // +3 is same as -1 mod 4
+		m.settingsField = 0
+		return m, handled()
+
+	case "up", "k":
+		// Previous field in section
+		if m.settingsField > 0 {
+			m.settingsField--
+		}
+		return m, handled()
+
+	case "down", "j":
+		// Next field in section
+		if m.settingsField < len(fields)-1 {
+			m.settingsField++
+		}
+		return m, handled()
+
+	case "i", " ":
+		// Edit current field
+		if len(fields) > 0 {
+			fieldIdx := fields[m.settingsField]
+			m.settingsEditing = true
+			m.settingsInputs[fieldIdx].Focus()
+			return m, textinput.Blink
+		}
+		return m, handled()
+
+	case "ctrl+c":
+		return m, tea.Quit
+	}
+
+	return m, handled()
+}
+
+// saveSettings saves the current settings input values to config
+func (m *Model) saveSettings() {
+	m.cfg.QBittorrent.Host = m.settingsInputs[0].Value()
+	// Parse port, default to 8080 on error
+	port := 8080
+	if _, err := fmt.Sscanf(m.settingsInputs[1].Value(), "%d", &port); err == nil {
+		m.cfg.QBittorrent.Port = port
+	}
+	m.cfg.QBittorrent.Username = m.settingsInputs[2].Value()
+	m.cfg.QBittorrent.Password = m.settingsInputs[3].Value()
+	m.cfg.Downloads.Path = m.settingsInputs[4].Value()
+	m.cfg.VPN.StatusScript = m.settingsInputs[5].Value()
+	m.cfg.VPN.ConnectScript = m.settingsInputs[6].Value()
+	m.cfg.Plex.MovieLibrary = m.settingsInputs[7].Value()
+	m.cfg.Plex.TVLibrary = m.settingsInputs[8].Value()
+
+	// Save to disk
+	_ = config.Save(m.cfg)
+
+	// Recreate clients with new config
+	m.qbitClient = qbit.NewClient(
+		m.cfg.QBittorrent.Host,
+		m.cfg.QBittorrent.Port,
+		m.cfg.QBittorrent.Username,
+		m.cfg.QBittorrent.Password,
+	)
+	m.vpnChecker = vpn.NewChecker(m.cfg.VPN.StatusScript, m.cfg.VPN.ConnectScript)
 }
 
 func (m Model) checkQbitStatus() tea.Cmd {
@@ -1242,20 +1430,189 @@ func (m Model) View() string {
 		}
 	}
 
-	// Quit confirmation modal overlay
+	// Get the base content
+	baseContent := b.String()
+
+	// Overlay modal if active
+	if m.showSettings {
+		return baseContent + "\n\n" + m.renderSettingsModal()
+	}
 	if m.confirmingQuit {
-		b.WriteString("\n\n")
-		modalStyle := lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color(theme.CurrentPalette.Accent)).
-			Padding(1, 3)
-		modalContent := styles.Title.Render("Quit?") + "\n\n" +
-			styles.Muted.Render("Press ") + styles.HelpKey.Render("q") + styles.Muted.Render(" or ") +
-			styles.HelpKey.Render("enter") + styles.Muted.Render(" to quit, any other key to cancel")
-		b.WriteString(modalStyle.Render(modalContent))
+		return baseContent + "\n\n" + m.renderQuitModal()
 	}
 
-	return b.String()
+	return baseContent
+}
+
+// overlayModal renders a modal over the base content with the base still visible
+func (m Model) overlayModal(base, modal string) string {
+	// Safety: if dimensions not set, just return the modal
+	if m.width == 0 || m.height == 0 {
+		return modal
+	}
+
+	baseLines := strings.Split(base, "\n")
+	modalLines := strings.Split(modal, "\n")
+
+	// Fixed position: after logo (~12 lines down), centered horizontally
+	topOffset := 12
+	modalWidth := lipgloss.Width(modal)
+	leftOffset := (m.width - modalWidth) / 2
+	if leftOffset < 0 {
+		leftOffset = 0
+	}
+	if leftOffset > 500 {
+		leftOffset = 0 // Safety bound
+	}
+
+	// Overlay modal lines onto base
+	for i, modalLine := range modalLines {
+		baseIdx := topOffset + i
+		if baseIdx >= len(baseLines) {
+			// Extend base if needed
+			for len(baseLines) <= baseIdx {
+				baseLines = append(baseLines, "")
+			}
+		}
+
+		// Build the line with modal overlaid
+		padding := strings.Repeat(" ", leftOffset)
+		baseLines[baseIdx] = padding + modalLine
+	}
+
+	return strings.Join(baseLines, "\n")
+}
+
+// truncateToWidth truncates a string to fit within a given display width
+func truncateToWidth(s string, maxWidth int) string {
+	var result strings.Builder
+	width := 0
+	for _, r := range s {
+		rWidth := 1
+		if r > 127 {
+			rWidth = 2 // Rough estimate for wide chars
+		}
+		if width+rWidth > maxWidth {
+			break
+		}
+		result.WriteRune(r)
+		width += rWidth
+	}
+	return result.String()
+}
+
+// renderQuitModal renders the quit confirmation modal
+func (m Model) renderQuitModal() string {
+	styles := GetStyles()
+
+	modalStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(theme.CurrentPalette.Accent)).
+		Background(lipgloss.Color(theme.CurrentPalette.BG)).
+		Padding(1, 3)
+
+	modalContent := styles.Title.Render("Quit?") + "\n\n" +
+		styles.Muted.Render("Press ") + styles.HelpKey.Render("q") + styles.Muted.Render(" or ") +
+		styles.HelpKey.Render("enter") + styles.Muted.Render(" to quit, any other key to cancel")
+
+	return modalStyle.Render(modalContent)
+}
+
+// renderSettingsModal renders the settings configuration modal
+func (m Model) renderSettingsModal() string {
+	styles := GetStyles()
+
+	// Modal container style
+	modalStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(theme.CurrentPalette.Accent)).
+		Background(lipgloss.Color(theme.CurrentPalette.BG)).
+		Padding(1, 2).
+		Width(70)
+
+	// Section tab styles
+	activeTabStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(theme.CurrentPalette.Accent)).
+		Bold(true).
+		Padding(0, 1)
+	inactiveTabStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color(theme.CurrentPalette.Muted)).
+		Padding(0, 1)
+
+	// Section tabs
+	sections := []string{"qBittorrent", "Downloads", "VPN", "Plex"}
+	var tabBar strings.Builder
+	for i, name := range sections {
+		if i == m.settingsSection {
+			tabBar.WriteString(activeTabStyle.Render("[" + name + "]"))
+		} else {
+			tabBar.WriteString(inactiveTabStyle.Render(" " + name + " "))
+		}
+	}
+
+	var content strings.Builder
+	content.WriteString(styles.Title.Render("Settings"))
+	content.WriteString("\n\n")
+	content.WriteString(tabBar.String())
+	content.WriteString("\n\n")
+
+	// Field labels for each section
+	fieldLabels := map[int][]string{
+		0: {"Host", "Port", "Username", "Password"},
+		1: {"Download Path"},
+		2: {"Status Script", "Connect Script"},
+		3: {"Movie Library", "TV Library"},
+	}
+
+	// Render fields for current section
+	fields := settingsSectionFields(m.settingsSection)
+	labels := fieldLabels[m.settingsSection]
+
+	for i, fieldIdx := range fields {
+		label := labels[i]
+		isSelected := i == m.settingsField
+		isEditing := isSelected && m.settingsEditing
+
+		// Label
+		var labelStr string
+		if isSelected {
+			labelStr = styles.Title.Render("› " + label + ":")
+		} else {
+			labelStr = styles.Muted.Render("  " + label + ":")
+		}
+
+		// Value
+		var valueStr string
+		if isEditing {
+			valueStr = m.settingsInputs[fieldIdx].View()
+		} else {
+			val := m.settingsInputs[fieldIdx].Value()
+			if val == "" {
+				val = "(not set)"
+			}
+			// Mask password
+			if fieldIdx == 3 && val != "(not set)" {
+				val = strings.Repeat("•", len(val))
+			}
+			if isSelected {
+				valueStr = styles.HelpKey.Render(val)
+			} else {
+				valueStr = styles.TableRow.Render(val)
+			}
+		}
+
+		content.WriteString(fmt.Sprintf("%-20s %s\n", labelStr, valueStr))
+	}
+
+	// Help text
+	content.WriteString("\n")
+	if m.settingsEditing {
+		content.WriteString(styles.Muted.Render("[esc/enter] Done editing"))
+	} else {
+		content.WriteString(styles.Muted.Render("[tab]Section [↑↓]Field [i]Edit [enter]Save [esc]Cancel"))
+	}
+
+	return modalStyle.Render(content.String())
 }
 
 func (m Model) renderLogo() string {
@@ -1463,19 +1820,20 @@ func (m Model) renderDownloadsTab(height int) string {
 		return b.String()
 	}
 
-	// Column widths - must match row widths exactly
-	// Rows have 2-char prefix ("› " or "  "), so header needs it too
-	colWidths := []int{0, 8, 7, 11, 11, 8}             // nameWidth set below, others fixed
-	nameWidth := m.width - 2 - 8 - 7 - 11 - 11 - 8 - 5 // 2=prefix, 5=spaces between cols
+	// Fixed column widths for right-side columns
+	sizeW, doneW, dlW, ulW, etaW := 8, 7, 11, 11, 8
+	rightColsWidth := sizeW + doneW + dlW + ulW + etaW + 5 // 5 spaces between
+	nameWidth := m.width - 2 - rightColsWidth              // 2 for prefix
 	if nameWidth < 20 {
 		nameWidth = 20
 	}
-	colWidths[0] = nameWidth
 
+	// Build header with per-column styling
 	colNames := []string{"NAME", "SIZE", "DONE", "DL", "UL", "ETA"}
+	colWidths := []int{nameWidth, sizeW, doneW, dlW, ulW, etaW}
 
-	// Build header with sort indicator - sorted column gets highlighted
-	var headerParts []string
+	var headerRow strings.Builder
+	headerRow.WriteString("  ") // prefix
 	for i, name := range colNames {
 		w := colWidths[i]
 		ind := " "
@@ -1486,44 +1844,31 @@ func (m Model) renderDownloadsTab(height int) string {
 				ind = "▼"
 			}
 		}
-		// Build column text
-		// NAME (col 0): left-align, arrow after name
-		// Others: right-align, arrow prepended
+
 		var colText string
 		if i == 0 {
-			// NAME: left-align, indicator right after name
-			padding := w - len(name) - 1
-			if padding < 0 {
-				padding = 0
-			}
-			colText = name + ind + repeat(" ", padding)
+			// NAME: left-align, indicator after name
+			colText = name + ind + repeat(" ", w-len(name)-1)
 		} else {
-			// Others: right-align, indicator prepended
-			padding := w - len(name) - 1
-			if padding < 0 {
-				padding = 0
-			}
-			colText = repeat(" ", padding) + ind + name
+			// Others: right-align, indicator before name
+			colText = " " + repeat(" ", w-len(name)-1) + ind + name
 		}
-		// Apply style - sorted column highlighted, others muted
+
+		// Style sorted column differently
 		if i == m.dlSortCol {
-			headerParts = append(headerParts, styles.SortedHeader.Render(colText))
+			headerRow.WriteString(styles.SortedHeader.Render(colText))
 		} else {
-			headerParts = append(headerParts, styles.Muted.Render(colText))
+			headerRow.WriteString(styles.Muted.Render(colText))
 		}
 	}
-	// Add 2-char prefix to match row prefix ("› " or "  ")
-	header := "  " + strings.Join(headerParts, styles.Muted.Render(" "))
-	// Render with border only (no foreground color override)
+
+	// Add underline border
 	headerStyle := lipgloss.NewStyle().
-		Bold(true).
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderBottom(true).
 		BorderForeground(lipgloss.Color(theme.CurrentPalette.Muted))
-	b.WriteString(headerStyle.Render(header))
+	b.WriteString(headerStyle.Render(headerRow.String()))
 	b.WriteString("\n")
-
-	// Torrents are already sorted in-place when sort changes or list refreshes
 
 	// Rows
 	visibleRows := height - 2
@@ -1543,22 +1888,20 @@ func (m Model) renderDownloadsTab(height int) string {
 
 	for i := startIdx; i < endIdx; i++ {
 		t := m.downloading[i]
-		name := TruncateString(t.Name, nameWidth-2) // -2 for "› " prefix
+		name := TruncateString(t.Name, nameWidth-1)
 		progress := fmt.Sprintf("%.1f%%", t.Progress*100)
 		dlSpeed := formatSpeed(t.DLSpeed)
 		ulSpeed := formatSpeed(t.UPSpeed)
 		eta := formatETA(t.AmountLeft, t.DLSpeed)
 		size := formatSize(t.Size)
 
-		// Match header widths exactly: nameWidth, 8, 7, 11, 11, 8
-		// All left-aligned except ETA (right-aligned)
-		row := fmt.Sprintf("%s %s %s %s %s %s",
-			PadRight(name, nameWidth),
-			PadRight(size, 8),
-			PadRight(progress, 7),
-			PadRight(dlSpeed, 11),
-			PadRight(ulSpeed, 11),
-			PadLeft(eta, 8))
+		// Build row with same spacing as header
+		row := PadRight(name, nameWidth) +
+			" " + PadLeft(size, sizeW) +
+			" " + PadLeft(progress, doneW) +
+			" " + PadLeft(dlSpeed, dlW) +
+			" " + PadLeft(ulSpeed, ulW) +
+			" " + PadLeft(eta, etaW)
 
 		if i == m.dlCursor {
 			b.WriteString(styles.TableSelected.Render("› " + row))
@@ -1778,9 +2121,9 @@ func (m Model) renderSourcesTab(height int) string {
 		// Build row: prefix + padded name + space + styled status
 		namePadded := PadRight(name, nameWidth)
 		if i == m.srcCursor {
-			b.WriteString(styles.TableSelected.Render("› " + namePadded + " ") + statusStyled)
+			b.WriteString(styles.TableSelected.Render("› "+namePadded+" ") + statusStyled)
 		} else {
-			b.WriteString(styles.TableRow.Render("  " + namePadded + " ") + statusStyled)
+			b.WriteString(styles.TableRow.Render("  "+namePadded+" ") + statusStyled)
 		}
 		b.WriteString("\n")
 	}
@@ -1799,7 +2142,7 @@ func (m Model) renderResults(height int) string {
 
 	// Column widths - must match row widths exactly
 	// Rows have 2-char prefix ("› " or "  "), so header needs it too
-	colWidths := []int{0, 10, 6, 6, 6}               // nameWidth set below, others fixed
+	colWidths := []int{0, 10, 6, 6, 6}                // nameWidth set below, others fixed
 	nameWidth := m.width - 2 - 10 - 6 - 6 - 6 - 4 - 2 // 2=prefix, 4=spaces between cols, 2=margin
 	if nameWidth < 20 {
 		nameWidth = 20
@@ -1972,9 +2315,9 @@ func (m Model) renderStatusBar() string {
 			help = "[a]Add [enter]Toggle [x]Remove [q]Quit"
 		default:
 			if m.mode == viewResults || m.mode == viewDetails {
-				help = "[←→]Sort [s]Toggle [enter]Download [d]Details [esc]Back [q]Quit"
+				help = "[←→]Sort [s]Toggle [enter]Download [d]Details [c]Config [q]Quit"
 			} else {
-				help = "[/]Search [v]VPN [q]Quit"
+				help = "[/]Search [v]VPN [c]Config [q]Quit"
 			}
 		}
 	}

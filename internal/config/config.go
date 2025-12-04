@@ -100,8 +100,8 @@ func Default() Config {
 		},
 		VPN: VPNConfig{
 			UseNative:     false, // Use scripts by default until native is implemented
-			StatusScript:  filepath.Join(home, "vpn", "nord", "nordvpn-status.sh"),
-			ConnectScript: filepath.Join(home, "vpn", "nord", "nordvpn-connect.sh"),
+			StatusScript:  "",    // User must configure
+			ConnectScript: "",    // User must configure
 		},
 		Downloads: DownloadsConfig{
 			Path: filepath.Join(home, "Downloads", "torrents"),

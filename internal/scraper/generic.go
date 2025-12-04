@@ -35,8 +35,8 @@ func NewGenericScraper(name, baseURL string) *GenericScraper {
 	}
 
 	return &GenericScraper{
-		name:       name,
-		baseURL:    baseDomain, // Use domain for search patterns
+		name:    name,
+		baseURL: baseDomain, // Use domain for search patterns
 		client: &http.Client{
 			Timeout: 15 * time.Second,
 			Jar:     jar,

@@ -77,6 +77,7 @@ type Model struct {
 	vpnChecked    bool // Have we done initial VPN check?
 	vpnConnecting bool // Are we currently connecting to VPN?
 	qbitOnline    bool
+	isFetching    bool // Guard against overlapping torrent fetches
 
 	// Torrent lists from qBittorrent
 	downloading []qbit.TorrentInfo
@@ -421,6 +422,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case torrentListMsg:
+		m.isFetching = false // Clear guard regardless of success/failure
 		if msg.err == nil {
 			m.downloading = msg.downloading
 			m.completed = msg.completed
@@ -431,7 +433,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		// Periodic refresh - fetch torrents and schedule next tick
-		cmds = append(cmds, m.fetchTorrents(), tickCmd())
+		// Skip if a fetch is already in-flight to prevent goroutine pile-up
+		if !m.isFetching {
+			m.isFetching = true
+			cmds = append(cmds, m.fetchTorrents())
+		}
+		cmds = append(cmds, tickCmd())
 
 	case torrentActionMsg:
 		if msg.err != nil {
@@ -1215,7 +1222,9 @@ func (m Model) checkQbitStatus() tea.Cmd {
 func (m Model) fetchTorrents() tea.Cmd {
 	client := m.qbitClient
 	return func() tea.Msg {
-		torrents, err := client.GetTorrents(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		torrents, err := client.GetTorrents(ctx)
 		if err != nil {
 			return torrentListMsg{err: err}
 		}

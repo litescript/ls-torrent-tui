@@ -51,7 +51,8 @@ type SearchSource struct {
 	URL     string
 	Enabled bool
 	Scraper scraper.Scraper
-	Builtin bool // true for built-in sources, false for user-added
+	Builtin bool   // true for built-in sources, false for user-added
+	Warning string // non-empty if source has issues (e.g., "search may not work")
 }
 
 // Model is the main application state
@@ -84,6 +85,10 @@ type Model struct {
 	// Sorting (downloads/completed tabs)
 	sortCol int  // 0=name, 1=size, 2=done, 3=dl, 4=ul, 5=eta
 	sortAsc bool // true=ascending, false=descending
+
+	// Search results sorting
+	searchSortCol int  // 0=name, 1=size, 2=seeds, 3=leech, 4=health
+	searchSortAsc bool // true=ascending, false=descending
 
 	// Search sources
 	sources       []SearchSource
@@ -345,6 +350,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Enabled: true,
 				Scraper: msg.scraper,
 				Builtin: false,
+				Warning: msg.warning,
 			})
 			m.saveSources()
 			m.statusMsg = fmt.Sprintf("Added source: %s%s", msg.name, msg.warning)
@@ -474,7 +480,12 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "alt+1":
 			m.activeTab = tabSearch
-			m.mode = viewSearch
+			// Preserve results view if we have results
+			if len(m.results) > 0 {
+				m.mode = viewResults
+			} else {
+				m.mode = viewSearch
+			}
 			m.addingURL = false
 			return m, handled()
 		case "alt+2":
@@ -520,7 +531,12 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key {
 	case "1", "alt+1":
 		m.activeTab = tabSearch
-		m.mode = viewSearch
+		// Preserve results view if we have results
+		if len(m.results) > 0 {
+			m.mode = viewResults
+		} else {
+			m.mode = viewSearch
+		}
 		m.addingURL = false
 		return m, handled()
 	case "2", "alt+2":
@@ -566,8 +582,12 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.saveSources()
 			return m, handled()
 		}
-		if m.mode == viewResults && len(m.results) > 0 {
-			return m, m.loadFiles()
+		if m.activeTab == tabSearch && m.mode == viewResults && len(m.results) > 0 {
+			if !m.vpnStatus.Connected {
+				m.statusMsg = "VPN required! Press V to connect"
+				return m, handled()
+			}
+			return m, m.downloadTorrent()
 		}
 		return m, handled()
 
@@ -614,7 +634,15 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, handled()
 
 	case "left", "h":
-		// Navigate sort columns (downloads/completed tabs)
+		// Navigate sort columns
+		if m.activeTab == tabSearch && m.mode == viewResults {
+			if m.searchSortCol > 0 {
+				m.searchSortCol--
+			} else {
+				m.searchSortCol = 4 // Wrap to last column (5 columns)
+			}
+			return m, handled()
+		}
 		if m.activeTab == tabDownloads {
 			if m.sortCol > 0 {
 				m.sortCol--
@@ -633,7 +661,15 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "right", "l":
-		// Navigate sort columns (downloads/completed tabs)
+		// Navigate sort columns
+		if m.activeTab == tabSearch && m.mode == viewResults {
+			if m.searchSortCol < 4 {
+				m.searchSortCol++
+			} else {
+				m.searchSortCol = 0 // Wrap to first column
+			}
+			return m, handled()
+		}
 		if m.activeTab == tabDownloads {
 			if m.sortCol < 5 {
 				m.sortCol++
@@ -652,6 +688,10 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "s": // Toggle sort direction
+		if m.activeTab == tabSearch && m.mode == viewResults {
+			m.searchSortAsc = !m.searchSortAsc
+			return m, handled()
+		}
 		if m.activeTab == tabDownloads || m.activeTab == tabCompleted {
 			m.sortAsc = !m.sortAsc
 			return m, handled()
@@ -678,13 +718,9 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, handled()
 		}
 
-	case "d":
+	case "d": // Details - load files for selected torrent
 		if m.activeTab == tabSearch && m.mode == viewResults && len(m.results) > 0 {
-			if !m.vpnStatus.Connected {
-				m.statusMsg = "VPN required! Press V to connect"
-				return m, handled()
-			}
-			return m, m.downloadTorrent()
+			return m, m.loadFiles()
 		}
 		return m, handled()
 
@@ -1251,6 +1287,31 @@ func calcETA(amountLeft, dlSpeed int64) int64 {
 	return amountLeft / dlSpeed
 }
 
+// sortSearchResults sorts search results (5 columns: name, size, seeds, leech, health)
+func sortSearchResults(results []scraper.Torrent, col int, asc bool) {
+	sort.Slice(results, func(i, j int) bool {
+		var less bool
+		switch col {
+		case 0: // Name
+			less = strings.ToLower(results[i].Name) < strings.ToLower(results[j].Name)
+		case 1: // Size (string comparison - not ideal but works for display)
+			less = results[i].Size < results[j].Size
+		case 2: // Seeds
+			less = results[i].Seeders < results[j].Seeders
+		case 3: // Leech
+			less = results[i].Leechers < results[j].Leechers
+		case 4: // Health
+			less = results[i].Health() < results[j].Health()
+		default:
+			less = results[i].Health() < results[j].Health()
+		}
+		if asc {
+			return less
+		}
+		return !less
+	})
+}
+
 // sortCompletedTorrents sorts completed torrents (4 columns: name, size, ratio, uploaded)
 func sortCompletedTorrents(torrents []qbit.TorrentInfo, col int, asc bool) {
 	sort.Slice(torrents, func(i, j int) bool {
@@ -1531,17 +1592,23 @@ func (m Model) renderSourcesTab(height int) string {
 		return b.String()
 	}
 
-	// Header
-	nameWidth := m.width - 30
+	// Column widths
+	statusWidth := 12
+	nameWidth := m.width - statusWidth - 6 // 2=prefix, 4=spacing
 	if nameWidth < 20 {
 		nameWidth = 20
 	}
 
-	header := fmt.Sprintf("%s %s %s",
+	// Header with border style like other tables
+	header := fmt.Sprintf("  %s %s",
 		PadRight("SOURCE", nameWidth),
-		PadLeft("STATUS", 12),
-		PadLeft("TYPE", 10))
-	b.WriteString(styles.TableHeader.Render(header))
+		PadLeft("STATUS", statusWidth))
+	headerStyle := lipgloss.NewStyle().
+		Bold(true).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderBottom(true).
+		BorderForeground(lipgloss.Color(theme.CurrentPalette.Muted))
+	b.WriteString(headerStyle.Render(header))
 	b.WriteString("\n")
 
 	// Rows
@@ -1563,10 +1630,18 @@ func (m Model) renderSourcesTab(height int) string {
 	for i := startIdx; i < endIdx; i++ {
 		src := m.sources[i]
 
-		name := TruncateString(src.Name, nameWidth-1)
+		// Show warning indicator if source has issues
+		name := src.Name
+		if src.Warning != "" {
+			name = "⚠ " + name
+		}
+		name = TruncateString(name, nameWidth-2)
 
 		var status, statusStyle string
-		if src.Enabled {
+		if src.Warning != "" {
+			status = "Warning"
+			statusStyle = styles.HealthMed.Render(status)
+		} else if src.Enabled {
 			status = "Enabled"
 			statusStyle = styles.VPNConnected.Render(status)
 		} else {
@@ -1574,20 +1649,12 @@ func (m Model) renderSourcesTab(height int) string {
 			statusStyle = styles.Muted.Render(status)
 		}
 
-		srcType := "Builtin"
-		if src.Scraper == nil {
-			srcType = "Custom"
-		}
-
-		row := fmt.Sprintf("%s %s %s",
-			PadRight(name, nameWidth),
-			PadLeft(statusStyle, 12+len(statusStyle)-len(status)), // Account for ANSI codes
-			PadLeft(srcType, 10))
+		statusPadded := PadLeft(statusStyle, statusWidth+len(statusStyle)-len(status)) // Account for ANSI codes
 
 		if i == m.srcCursor {
-			b.WriteString(styles.TableSelected.Render("› ") + row)
+			b.WriteString(styles.TableSelected.Render("› "+PadRight(name, nameWidth)) + " " + statusPadded)
 		} else {
-			b.WriteString(styles.TableRow.Render("  ") + row)
+			b.WriteString(styles.TableRow.Render("  "+PadRight(name, nameWidth)) + " " + statusPadded)
 		}
 		b.WriteString("\n")
 	}
@@ -1604,20 +1671,68 @@ func (m Model) renderResults(height int) string {
 
 	var b strings.Builder
 
-	// Table header
-	nameWidth := m.width - 50
+	// Column widths - must match row widths exactly
+	// Rows have 2-char prefix ("› " or "  "), so header needs it too
+	colWidths := []int{0, 10, 6, 6, 6}               // nameWidth set below, others fixed
+	nameWidth := m.width - 2 - 10 - 6 - 6 - 6 - 4 - 2 // 2=prefix, 4=spaces between cols, 2=margin
 	if nameWidth < 20 {
 		nameWidth = 20
 	}
+	colWidths[0] = nameWidth
 
-	header := fmt.Sprintf("%s %s %s %s %s",
-		PadRight("NAME", nameWidth),
-		PadLeft("SIZE", 10),
-		PadLeft("S", 5),
-		PadLeft("L", 5),
-		"HEALTH")
-	b.WriteString(styles.TableHeader.Render(header))
+	colNames := []string{"NAME", "SIZE", "SEED", "LEECH", "HEALTH"}
+
+	// Build header with sort indicator - sorted column gets highlighted
+	var headerParts []string
+	for i, name := range colNames {
+		w := colWidths[i]
+		ind := " "
+		if i == m.searchSortCol {
+			if m.searchSortAsc {
+				ind = "▲"
+			} else {
+				ind = "▼"
+			}
+		}
+		// Build column text - indicator right after name, padded to full width
+		var colText string
+		if i == 0 {
+			// NAME: left-align
+			padding := w - len(name) - 1
+			if padding < 0 {
+				padding = 0
+			}
+			colText = name + ind + repeat(" ", padding)
+		} else {
+			// Others: right-align
+			padding := w - len(name) - 1
+			if padding < 0 {
+				padding = 0
+			}
+			colText = repeat(" ", padding) + ind + name
+		}
+		// Apply style - sorted column highlighted, others muted
+		if i == m.searchSortCol {
+			headerParts = append(headerParts, styles.SortedHeader.Render(colText))
+		} else {
+			headerParts = append(headerParts, styles.Muted.Render(colText))
+		}
+	}
+	// Add 2-char prefix to match row prefix ("› " or "  ")
+	header := "  " + strings.Join(headerParts, styles.Muted.Render(" "))
+	// Render with border only (no foreground color override)
+	headerStyle := lipgloss.NewStyle().
+		Bold(true).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderBottom(true).
+		BorderForeground(lipgloss.Color(theme.CurrentPalette.Muted))
+	b.WriteString(headerStyle.Render(header))
 	b.WriteString("\n")
+
+	// Sort results
+	sorted := make([]scraper.Torrent, len(m.results))
+	copy(sorted, m.results)
+	sortSearchResults(sorted, m.searchSortCol, m.searchSortAsc)
 
 	// Calculate visible range
 	visibleRows := height - 3
@@ -1631,28 +1746,27 @@ func (m Model) renderResults(height int) string {
 	}
 
 	endIdx := startIdx + visibleRows
-	if endIdx > len(m.results) {
-		endIdx = len(m.results)
+	if endIdx > len(sorted) {
+		endIdx = len(sorted)
 	}
 
 	// Render rows
 	for i := startIdx; i < endIdx; i++ {
-		t := m.results[i]
-		name := TruncateString(t.Name, nameWidth-1)
+		t := sorted[i]
+		name := TruncateString(t.Name, nameWidth-2) // -2 for "› " prefix
 
+		// Match header widths exactly
 		row := fmt.Sprintf("%s %s %s %s %s",
 			PadRight(name, nameWidth),
 			PadLeft(t.Size, 10),
-			PadLeft(fmt.Sprintf("%d", t.Seeders), 5),
-			PadLeft(fmt.Sprintf("%d", t.Leechers), 5),
-			HealthBar(t.Health(), 5))
+			PadLeft(fmt.Sprintf("%d", t.Seeders), 6),
+			PadLeft(fmt.Sprintf("%d", t.Leechers), 6),
+			HealthBar(t.Health(), 6))
 
 		if i == m.cursor {
-			prefix := "› "
-			b.WriteString(styles.TableSelected.Render(prefix + row))
+			b.WriteString(styles.TableSelected.Render("› " + row))
 		} else {
-			prefix := "  "
-			b.WriteString(styles.TableRow.Render(prefix + row))
+			b.WriteString(styles.TableRow.Render("  " + row))
 		}
 		b.WriteString("\n")
 	}
@@ -1723,7 +1837,11 @@ func (m Model) renderStatusBar() string {
 		case tabSources:
 			help = "[a]Add [enter]Toggle [x]Remove [q]Back"
 		default:
-			help = "[/]Search [d]Download [v]VPN [q]Quit"
+			if m.mode == viewResults {
+				help = "[←→]Sort [s]Toggle [enter]Download [d]Details [q]Back"
+			} else {
+				help = "[/]Search [v]VPN [q]Quit"
+			}
 		}
 	}
 

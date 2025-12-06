@@ -83,9 +83,10 @@ type Model struct {
 	downloading []qbit.TorrentInfo
 	completed   []qbit.TorrentInfo
 
-	// Sorting (downloads tab): 0=name, 1=size, 2=done, 3=dl, 4=ul, 5=eta
-	dlSortCol int
-	dlSortAsc bool
+	// Sorting (downloads tab): 0=name, 1=size, 2=done, 3=dl, 4=ul, 5=seed, 6=leech, 7=eta
+	dlSortCol    int
+	dlSortAsc    bool
+	followingHash string // Hash of torrent to follow (keeps cursor on it during re-sorts)
 
 	// Sorting (completed tab): 0=name, 1=size, 2=ratio, 3=uploaded
 	compSortCol int
@@ -429,6 +430,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Apply current sort settings
 			sortTorrents(m.downloading, m.dlSortCol, m.dlSortAsc)
 			sortCompletedTorrents(m.completed, m.compSortCol, m.compSortAsc)
+			// Update cursor to follow tracked torrent
+			if m.followingHash != "" {
+				if idx, found := findTorrentByHash(m.downloading, m.followingHash); found {
+					m.dlCursor = idx
+				} else {
+					// Torrent completed or was removed - stop following
+					m.followingHash = ""
+				}
+			}
 		}
 
 	case tickMsg:
@@ -767,7 +777,7 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.dlSortCol > 0 {
 				m.dlSortCol--
 			} else {
-				m.dlSortCol = 5 // Wrap to last column (6 columns)
+				m.dlSortCol = 7 // Wrap to last column (8 columns)
 			}
 			sortTorrents(m.downloading, m.dlSortCol, m.dlSortAsc)
 			m.saveSortSettings()
@@ -797,7 +807,7 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, handled()
 		}
 		if m.activeTab == tabDownloads {
-			if m.dlSortCol < 5 {
+			if m.dlSortCol < 7 {
 				m.dlSortCol++
 			} else {
 				m.dlSortCol = 0 // Wrap to first column
@@ -869,6 +879,20 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "p": // Pause/Resume toggle
 		if m.activeTab == tabDownloads && len(m.downloading) > 0 {
 			return m, m.togglePauseTorrent()
+		}
+		return m, handled()
+
+	case "f": // Follow/unfollow torrent (keep cursor on it during re-sorts)
+		if m.activeTab == tabDownloads && len(m.downloading) > 0 && m.dlCursor < len(m.downloading) {
+			t := m.downloading[m.dlCursor]
+			if m.followingHash == t.Hash {
+				m.followingHash = ""
+				m.statusMsg = "Unfollowed: " + TruncateString(t.Name, 30)
+			} else {
+				m.followingHash = t.Hash
+				m.statusMsg = "Following: " + TruncateString(t.Name, 30)
+			}
+			return m, handled()
 		}
 		return m, handled()
 
@@ -1761,7 +1785,11 @@ func sortTorrents(torrents []qbit.TorrentInfo, col int, asc bool) {
 			less = torrents[i].DLSpeed < torrents[j].DLSpeed
 		case 4: // UL speed
 			less = torrents[i].UPSpeed < torrents[j].UPSpeed
-		case 5: // ETA
+		case 5: // Seeds
+			less = torrents[i].NumSeeds < torrents[j].NumSeeds
+		case 6: // Leechers
+			less = torrents[i].NumLeechers < torrents[j].NumLeechers
+		case 7: // ETA
 			etaI := calcETA(torrents[i].AmountLeft, torrents[i].DLSpeed)
 			etaJ := calcETA(torrents[j].AmountLeft, torrents[j].DLSpeed)
 			less = etaI < etaJ
@@ -1780,6 +1808,16 @@ func calcETA(amountLeft, dlSpeed int64) int64 {
 		return 1<<62 - 1 // Very large number for infinite
 	}
 	return amountLeft / dlSpeed
+}
+
+// findTorrentByHash returns the index and whether a torrent was found by hash
+func findTorrentByHash(torrents []qbit.TorrentInfo, hash string) (int, bool) {
+	for i, t := range torrents {
+		if t.Hash == hash {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 // sortSearchResults sorts search results (5 columns: name, size, seeds, leech, health)
@@ -1842,16 +1880,16 @@ func (m Model) renderDownloadsTab(height int) string {
 	}
 
 	// Fixed column widths for right-side columns
-	sizeW, doneW, dlW, ulW, etaW := 8, 7, 11, 11, 8
-	rightColsWidth := sizeW + doneW + dlW + ulW + etaW + 5 // 5 spaces between
-	nameWidth := m.width - 2 - rightColsWidth              // 2 for prefix
+	sizeW, doneW, dlW, ulW, seedW, leechW, etaW := 8, 7, 11, 11, 5, 6, 8
+	rightColsWidth := sizeW + doneW + dlW + ulW + seedW + leechW + etaW + 7 // 7 spaces between
+	nameWidth := m.width - 2 - rightColsWidth                               // 2 for prefix
 	if nameWidth < 20 {
 		nameWidth = 20
 	}
 
 	// Build header with per-column styling
-	colNames := []string{"NAME", "SIZE", "DONE", "DL", "UL", "ETA"}
-	colWidths := []int{nameWidth, sizeW, doneW, dlW, ulW, etaW}
+	colNames := []string{"NAME", "SIZE", "DONE", "DL", "UL", "SEED", "LEECH", "ETA"}
+	colWidths := []int{nameWidth, sizeW, doneW, dlW, ulW, seedW, leechW, etaW}
 
 	var headerRow strings.Builder
 	headerRow.WriteString("  ") // prefix
@@ -1915,6 +1953,8 @@ func (m Model) renderDownloadsTab(height int) string {
 		ulSpeed := formatSpeed(t.UPSpeed)
 		eta := formatETA(t.AmountLeft, t.DLSpeed)
 		size := formatSize(t.Size)
+		seeds := fmt.Sprintf("%d", t.NumSeeds)
+		leechers := fmt.Sprintf("%d", t.NumLeechers)
 
 		// Build row with same spacing as header
 		row := PadRight(name, nameWidth) +
@@ -1922,12 +1962,23 @@ func (m Model) renderDownloadsTab(height int) string {
 			" " + PadLeft(progress, doneW) +
 			" " + PadLeft(dlSpeed, dlW) +
 			" " + PadLeft(ulSpeed, ulW) +
+			" " + PadLeft(seeds, seedW) +
+			" " + PadLeft(leechers, leechW) +
 			" " + PadLeft(eta, etaW)
 
+		isFollowing := m.followingHash == t.Hash
 		if i == m.dlCursor {
-			b.WriteString(styles.TableSelected.Render("› " + row))
+			if isFollowing {
+				b.WriteString(styles.VPNConnected.Render("◉ ") + styles.TableSelected.Render(row))
+			} else {
+				b.WriteString(styles.TableSelected.Render("› " + row))
+			}
 		} else {
-			b.WriteString(styles.TableRow.Render("  " + row))
+			if isFollowing {
+				b.WriteString(styles.VPNConnected.Render("◉ ") + styles.TableRow.Render(row))
+			} else {
+				b.WriteString(styles.TableRow.Render("  " + row))
+			}
 		}
 		b.WriteString("\n")
 	}
@@ -2329,7 +2380,7 @@ func (m Model) renderStatusBar() string {
 	} else {
 		switch m.activeTab {
 		case tabDownloads:
-			help = "[←→]Sort col [s]Toggle sort [p]Pause [x]Remove [q]Quit"
+			help = "[←→]Sort [s]Toggle [f]Follow [p]Pause [x]Remove [q]Quit"
 		case tabCompleted:
 			help = "[←→]Sort col [s]Toggle sort [m]Plex [x]Remove [q]Quit"
 		case tabSources:

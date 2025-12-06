@@ -84,8 +84,8 @@ type Model struct {
 	completed   []qbit.TorrentInfo
 
 	// Sorting (downloads tab): 0=name, 1=size, 2=done, 3=dl, 4=ul, 5=seed, 6=leech, 7=eta
-	dlSortCol    int
-	dlSortAsc    bool
+	dlSortCol     int
+	dlSortAsc     bool
 	followingHash string // Hash of torrent to follow (keeps cursor on it during re-sorts)
 
 	// Sorting (completed tab): 0=name, 1=size, 2=ratio, 3=uploaded

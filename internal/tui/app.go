@@ -1660,8 +1660,65 @@ func (m Model) renderSettingsModal() string {
 	return modalStyle.Render(content.String())
 }
 
+// logoGradientColor returns a hex color for a position in the logo gradient.
+// Creates a sunset effect: golden yellow -> orange -> deep rust
+func logoGradientColor(col, row, width, height int) string {
+	// Normalize positions to 0-1
+	xRatio := float64(col) / float64(width)
+	yRatio := float64(row) / float64(height)
+
+	// Horizontal gradient - sunset orange palette
+	// Golden Yellow (#FFCC00) -> Vibrant Orange (#FF6B35) -> Deep Rust (#8B2500)
+	var r, g, b float64
+
+	if xRatio < 0.5 {
+		// Golden Yellow to Vibrant Orange
+		t := xRatio / 0.5
+		r = 255 + t*(255-255)
+		g = 204 + t*(107-204)
+		b = 0 + t*(53-0)
+	} else {
+		// Vibrant Orange to Deep Rust
+		t := (xRatio - 0.5) / 0.5
+		r = 255 + t*(139-255)
+		g = 107 + t*(37-107)
+		b = 53 + t*(0-53)
+	}
+
+	// Vertical fade: brighter at top, darker toward bottom
+	brightnessFactor := 1.0 - (yRatio * 0.5)
+	r *= brightnessFactor
+	g *= brightnessFactor
+	b *= brightnessFactor
+
+	// Clamp to valid range
+	ri := int(r)
+	gi := int(g)
+	bi := int(b)
+	if ri > 255 {
+		ri = 255
+	}
+	if gi > 255 {
+		gi = 255
+	}
+	if bi > 255 {
+		bi = 255
+	}
+	if ri < 0 {
+		ri = 0
+	}
+	if gi < 0 {
+		gi = 0
+	}
+	if bi < 0 {
+		bi = 0
+	}
+
+	return fmt.Sprintf("#%02X%02X%02X", ri, gi, bi)
+}
+
 func (m Model) renderLogo() string {
-	// ASCII art with gradient coloring derived from theme FG
+	// ASCII art with smooth truecolor gradient
 	logo := []string{
 		`  ██╗     ███████╗    ████████╗ ██████╗ ██████╗ ██████╗ ███████╗███╗   ██╗████████╗`,
 		`  ██║     ██╔════╝    ╚══██╔══╝██╔═══██╗██╔══██╗██╔══██╗██╔════╝████╗  ██║╚══██╔══╝`,
@@ -1671,23 +1728,20 @@ func (m Model) renderLogo() string {
 		`  ╚══════╝╚══════╝       ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝   ╚═╝   `,
 	}
 
-	// Sunset orange gradient - bright yellow-orange at top fading to deep red
-	colors := []string{
-		"#FFCC00", // Bright golden yellow
-		"#FF9500", // Vibrant orange
-		"#FF6B35", // Warm orange
-		"#E84A27", // Deep orange-red
-		"#C43520", // Burnt sienna
-		"#8B2500", // Dark rust
-	}
-
 	var b strings.Builder
 	b.WriteString("\n")
 
-	for i, line := range logo {
-		color := colors[i]
-		style := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
-		b.WriteString(style.Render(line))
+	// Render each line with a horizontal truecolor gradient
+	for row, line := range logo {
+		runes := []rune(line)
+		lineLen := len(runes)
+
+		for col, r := range runes {
+			// Create a smooth gradient based on position
+			color := logoGradientColor(col, row, lineLen, len(logo))
+			style := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
+			b.WriteString(style.Render(string(r)))
+		}
 		b.WriteString("\n")
 	}
 

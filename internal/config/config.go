@@ -80,11 +80,9 @@ type PlexConfig struct {
 	// When false, user must explicitly choose during move operation.
 	AutoDetect bool `toml:"auto_detect"`
 
-	// TODO: Future settings to consider:
-	// - Naming templates
-	// - API integration (Plex server URL, token)
-	// - Library scan triggering
-	// - Subtitle handling
+	// UseSudo prefixes rsync commands with sudo for NAS mount permissions.
+	// Requires passwordless sudo for rsync: username ALL=(ALL) NOPASSWD: /usr/bin/rsync
+	UseSudo bool `toml:"use_sudo"`
 }
 
 // Default returns the default configuration
@@ -110,6 +108,7 @@ func Default() Config {
 			MovieLibrary: "", // Must be configured by user
 			TVLibrary:    "", // Must be configured by user
 			AutoDetect:   true,
+			UseSudo:      true, // Use sudo for NAS mounts by default
 		},
 		Sort: SortConfig{
 			SearchCol:    2,     // Default: seeds (most seeders first)

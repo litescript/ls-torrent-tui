@@ -1,6 +1,11 @@
 package plex
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
+)
 
 // ErrInvalidInput indicates the input cannot be processed for naming.
 var ErrInvalidInput = errors.New("invalid input for naming")
@@ -25,47 +30,70 @@ type TVNaming struct {
 
 // FormatMoviePath generates a Plex-compatible path for a movie.
 // Returns: "Title (Year)/Title (Year).ext"
-// TODO: Implement proper formatting with:
-//   - Character sanitization for filesystem safety
-//   - Configurable naming templates
-//   - Quality suffix options
 func FormatMoviePath(m MovieNaming) (string, error) {
-	// TODO: Implement movie path formatting
-	//
-	// Plex convention: Movie Name (2024)/Movie Name (2024).mkv
-	//
-	// Must handle:
-	// - Special characters in titles
-	// - Missing year information
-	// - Multi-file movies (CD1, CD2, Part 1, etc.)
-	// - Extras and bonus content
-	return "", ErrInvalidInput
+	if m.Title == "" {
+		return "", ErrInvalidInput
+	}
+
+	title := SanitizeFilename(m.Title)
+
+	var folderName, fileName string
+	if m.Year > 0 {
+		folderName = fmt.Sprintf("%s (%d)", title, m.Year)
+		fileName = fmt.Sprintf("%s (%d)%s", title, m.Year, m.Extension)
+	} else {
+		folderName = title
+		fileName = title + m.Extension
+	}
+
+	return filepath.Join(folderName, fileName), nil
 }
 
-// FormatTVPath generates a Plex-compatible path for a TV episode.
-// Returns: "Show Title/Season ##/Show Title - S##E## - Episode Title.ext"
-// TODO: Implement proper formatting.
+// FormatTVPath generates a Plex-compatible directory path for a TV episode.
+// Returns: "Show Title/Season ##" - caller appends original filename.
 func FormatTVPath(t TVNaming) (string, error) {
-	// TODO: Implement TV path formatting
-	//
-	// Plex convention: Show Name/Season 01/Show Name - S01E01 - Episode Title.mkv
-	//
-	// Must handle:
-	// - Multi-episode files (S01E01E02 or S01E01-E03)
-	// - Specials (Season 00)
-	// - Missing episode titles
-	// - Anime absolute numbering
-	return "", ErrInvalidInput
+	if t.ShowTitle == "" {
+		return "", ErrInvalidInput
+	}
+
+	showDir := SanitizeFilename(t.ShowTitle)
+	seasonDir := fmt.Sprintf("Season %02d", t.Season)
+
+	// Return just the directory path - original filename is kept for TV
+	return filepath.Join(showDir, seasonDir), nil
+}
+
+// FormatTVFilename generates a Plex-compatible filename for a TV episode.
+// Returns: "Show Title - S##E## - Episode Title.ext" or "Show Title - S##E##.ext"
+func FormatTVFilename(t TVNaming) string {
+	title := SanitizeFilename(t.ShowTitle)
+
+	if t.EpisodeTitle != "" {
+		epTitle := SanitizeFilename(t.EpisodeTitle)
+		return fmt.Sprintf("%s - S%02dE%02d - %s%s", title, t.Season, t.Episode, epTitle, t.Extension)
+	}
+	return fmt.Sprintf("%s - S%02dE%02d%s", title, t.Season, t.Episode, t.Extension)
 }
 
 // SanitizeFilename removes or replaces characters that are invalid
 // for filesystem paths.
-// TODO: Implement cross-platform path sanitization.
 func SanitizeFilename(name string) string {
-	// TODO: Implement filename sanitization
-	//
-	// Must remove/replace: / \ : * ? " < > |
-	// Preserve Unicode where safe
-	// Handle leading/trailing spaces and dots
-	return name
+	// Characters that are invalid on most filesystems
+	replacer := strings.NewReplacer(
+		"/", "-",
+		"\\", "-",
+		":", "-",
+		"*", "",
+		"?", "",
+		"\"", "'",
+		"<", "",
+		">", "",
+		"|", "-",
+	)
+	result := replacer.Replace(name)
+
+	// Remove leading/trailing spaces and dots
+	result = strings.Trim(result, " .")
+
+	return result
 }

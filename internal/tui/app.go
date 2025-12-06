@@ -18,6 +18,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/litescript/ls-torrent-tui/internal/config"
+	"github.com/litescript/ls-torrent-tui/internal/plex"
 	"github.com/litescript/ls-torrent-tui/internal/qbit"
 	"github.com/litescript/ls-torrent-tui/internal/scraper"
 	"github.com/litescript/ls-torrent-tui/internal/theme"
@@ -115,6 +116,22 @@ type Model struct {
 	settingsEditing bool              // Are we editing a field?
 	settingsInputs  []textinput.Model // Text inputs for settings fields
 
+	// Move to Plex modal state
+	showMoveModal   bool                 // Are we showing the move modal?
+	moveDetection   plex.DetectionResult // Auto-detected media info
+	moveMediaType   plex.MediaType       // Current selection (togglable)
+	moveSourcePath  string               // Full source path of selected torrent
+	moveDestPreview string               // Generated destination path preview
+	moveSubtitles   []string             // Found subtitle files
+	moveCleanup     bool                 // Whether to delete source after move
+	moveEditing     bool                 // Is user editing the title?
+	moveTitleInput  textinput.Model      // Editable title field
+	moveProgress    float64              // Transfer progress (0.0-1.0)
+	moveInProgress  bool                 // Is a move operation running?
+	moveError       string               // Error message if move failed
+	moveTotalBytes  int64                // Total bytes to transfer
+	moveCopiedBytes int64                // Bytes copied so far
+
 	// Dimensions
 	width  int
 	height int
@@ -201,12 +218,12 @@ func NewModel(cfg config.Config) Model {
 	urlIn.CharLimit = 512
 	urlIn.Width = 60
 
-	// Settings inputs (9 fields total)
+	// Settings inputs (10 fields total)
 	// qBit: host, port, username, password (indices 0-3)
 	// Downloads: path (index 4)
 	// VPN: status_script, connect_script (indices 5-6)
-	// Plex: movie_library, tv_library (indices 7-8)
-	settingsInputs := make([]textinput.Model, 9)
+	// Plex: movie_library, tv_library, use_sudo (indices 7-9)
+	settingsInputs := make([]textinput.Model, 10)
 	for i := range settingsInputs {
 		settingsInputs[i] = textinput.New()
 		settingsInputs[i].CharLimit = 256
@@ -223,6 +240,11 @@ func NewModel(cfg config.Config) Model {
 	settingsInputs[6].SetValue(cfg.VPN.ConnectScript)
 	settingsInputs[7].SetValue(cfg.Plex.MovieLibrary)
 	settingsInputs[8].SetValue(cfg.Plex.TVLibrary)
+	if cfg.Plex.UseSudo {
+		settingsInputs[9].SetValue("yes")
+	} else {
+		settingsInputs[9].SetValue("no")
+	}
 
 	// Initialize search sources from config
 	// No built-in sources - users add their own via the Sources tab
@@ -422,6 +444,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = fmt.Sprintf("Added source: %s%s", msg.name, msg.warning)
 		}
 
+	case moveCompleteMsg:
+		m.moveInProgress = false
+		if msg.err != nil {
+			m.moveError = msg.err.Error()
+		} else {
+			m.showMoveModal = false
+			m.statusMsg = fmt.Sprintf("Moved to Plex: %s", TruncateString(msg.result.DestinationPath, 40))
+			// Refresh torrent list to reflect changes
+			return m, m.fetchTorrents()
+		}
+
 	case torrentListMsg:
 		m.isFetching = false // Clear guard regardless of success/failure
 		if msg.err == nil {
@@ -523,6 +556,11 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.confirmingQuit = false
 			return m, handled()
 		}
+	}
+
+	// Handle move modal
+	if m.showMoveModal {
+		return m.handleMoveModalKey(key)
 	}
 
 	// Handle settings modal
@@ -928,15 +966,9 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, handled()
 
-	case "m": // Move to Plex (movies)
+	case "m": // Move to Plex
 		if m.activeTab == tabCompleted && len(m.completed) > 0 {
-			return m, m.moveToPlexMovie()
-		}
-		return m, handled()
-
-	case "t": // Move to Plex TV
-		if m.activeTab == tabCompleted && len(m.completed) > 0 {
-			return m, m.moveToPlexTV()
+			return m.openMoveModal()
 		}
 		return m, handled()
 
@@ -970,6 +1002,11 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.settingsInputs[6].SetValue(m.cfg.VPN.ConnectScript)
 		m.settingsInputs[7].SetValue(m.cfg.Plex.MovieLibrary)
 		m.settingsInputs[8].SetValue(m.cfg.Plex.TVLibrary)
+		if m.cfg.Plex.UseSudo {
+			m.settingsInputs[9].SetValue("yes")
+		} else {
+			m.settingsInputs[9].SetValue("no")
+		}
 		return m, handled()
 
 	case "/", "i": // / or i to focus search input (preserves results)
@@ -1122,7 +1159,7 @@ func (m Model) saveSortSettings() {
 // Section 0 (qBit): fields 0-3 (host, port, username, password)
 // Section 1 (Downloads): field 4 (path)
 // Section 2 (VPN): fields 5-6 (status_script, connect_script)
-// Section 3 (Plex): fields 7-8 (movie_library, tv_library)
+// Section 3 (Plex): fields 7-9 (movie_library, tv_library, use_sudo)
 func settingsSectionFields(section int) []int {
 	switch section {
 	case 0:
@@ -1132,7 +1169,7 @@ func settingsSectionFields(section int) []int {
 	case 2:
 		return []int{5, 6}
 	case 3:
-		return []int{7, 8}
+		return []int{7, 8, 9}
 	default:
 		return []int{}
 	}
@@ -1153,6 +1190,13 @@ func (m Model) handleSettingsKey(key string) (tea.Model, tea.Cmd) {
 		case "enter":
 			m.settingsEditing = false
 			m.settingsInputs[fieldIdx].Blur()
+			return m, handled()
+		case "tab":
+			// Tab completion for path fields
+			if isPathField(fieldIdx) {
+				m.completePathInput(fieldIdx)
+				return m, handled()
+			}
 			return m, handled()
 		default:
 			// Let the text input handle it
@@ -1219,6 +1263,105 @@ func (m Model) handleSettingsKey(key string) (tea.Model, tea.Cmd) {
 	return m, handled()
 }
 
+// completePathInput performs tab completion on a path input field.
+// Returns true if completion was performed.
+func (m *Model) completePathInput(fieldIdx int) bool {
+	input := m.settingsInputs[fieldIdx].Value()
+	if input == "" {
+		return false
+	}
+
+	// Expand ~ to home directory
+	if strings.HasPrefix(input, "~/") {
+		home, _ := os.UserHomeDir()
+		input = filepath.Join(home, input[2:])
+	} else if input == "~" {
+		home, _ := os.UserHomeDir()
+		m.settingsInputs[fieldIdx].SetValue(home + "/")
+		m.settingsInputs[fieldIdx].SetCursor(len(home) + 1)
+		return true
+	}
+
+	// Get directory and prefix to match
+	dir := filepath.Dir(input)
+	prefix := filepath.Base(input)
+
+	// If input ends with /, we're completing inside that directory
+	if strings.HasSuffix(input, "/") {
+		dir = input
+		prefix = ""
+	}
+
+	// Read directory entries
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+
+	// Find matches
+	var matches []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, prefix) {
+			fullPath := filepath.Join(dir, name)
+			if entry.IsDir() {
+				fullPath += "/"
+			}
+			matches = append(matches, fullPath)
+		}
+	}
+
+	if len(matches) == 0 {
+		return false
+	}
+
+	if len(matches) == 1 {
+		// Single match - complete it
+		result := matches[0]
+		// Convert back to ~ prefix if it was used
+		home, _ := os.UserHomeDir()
+		if strings.HasPrefix(result, home) {
+			result = "~" + result[len(home):]
+		}
+		m.settingsInputs[fieldIdx].SetValue(result)
+		m.settingsInputs[fieldIdx].SetCursor(len(result))
+		return true
+	}
+
+	// Multiple matches - complete to longest common prefix
+	common := matches[0]
+	for _, match := range matches[1:] {
+		for i := 0; i < len(common) && i < len(match); i++ {
+			if common[i] != match[i] {
+				common = common[:i]
+				break
+			}
+		}
+		if len(match) < len(common) {
+			common = common[:len(match)]
+		}
+	}
+
+	if len(common) > len(input) {
+		// Convert back to ~ prefix if it was used
+		home, _ := os.UserHomeDir()
+		if strings.HasPrefix(common, home) {
+			common = "~" + common[len(home):]
+		}
+		m.settingsInputs[fieldIdx].SetValue(common)
+		m.settingsInputs[fieldIdx].SetCursor(len(common))
+		return true
+	}
+
+	return false
+}
+
+// isPathField returns true if the settings field index is a path input
+func isPathField(fieldIdx int) bool {
+	// 4=Download Path, 5=VPN Status, 6=VPN Connect, 7=Movie Library, 8=TV Library
+	return fieldIdx >= 4 && fieldIdx <= 8
+}
+
 // saveSettings saves the current settings input values to config
 func (m *Model) saveSettings() {
 	m.cfg.QBittorrent.Host = m.settingsInputs[0].Value()
@@ -1234,9 +1377,33 @@ func (m *Model) saveSettings() {
 	m.cfg.VPN.ConnectScript = m.settingsInputs[6].Value()
 	m.cfg.Plex.MovieLibrary = m.settingsInputs[7].Value()
 	m.cfg.Plex.TVLibrary = m.settingsInputs[8].Value()
+	useSudoVal := strings.ToLower(m.settingsInputs[9].Value())
+	m.cfg.Plex.UseSudo = useSudoVal == "yes" || useSudoVal == "true" || useSudoVal == "1"
+
+	// Validate Plex library paths
+	var warnings []string
+	if m.cfg.Plex.MovieLibrary != "" {
+		if info, err := os.Stat(m.cfg.Plex.MovieLibrary); err != nil {
+			warnings = append(warnings, "Movie library path not found")
+		} else if !info.IsDir() {
+			warnings = append(warnings, "Movie library is not a directory")
+		}
+	}
+	if m.cfg.Plex.TVLibrary != "" {
+		if info, err := os.Stat(m.cfg.Plex.TVLibrary); err != nil {
+			warnings = append(warnings, "TV library path not found")
+		} else if !info.IsDir() {
+			warnings = append(warnings, "TV library is not a directory")
+		}
+	}
 
 	// Save to disk
 	_ = config.Save(m.cfg)
+
+	// Set warning status if paths invalid
+	if len(warnings) > 0 {
+		m.statusMsg = "Settings saved. Warning: " + strings.Join(warnings, ", ")
+	}
 
 	// Recreate clients with new config
 	m.qbitClient = qbit.NewClient(
@@ -1246,6 +1413,240 @@ func (m *Model) saveSettings() {
 		m.cfg.QBittorrent.Password,
 	)
 	m.vpnChecker = vpn.NewChecker(m.cfg.VPN.StatusScript, m.cfg.VPN.ConnectScript)
+}
+
+// openMoveModal opens the move to Plex modal for the selected torrent
+func (m Model) openMoveModal() (tea.Model, tea.Cmd) {
+	// Validate config - paths must be set
+	if m.cfg.Plex.MovieLibrary == "" || m.cfg.Plex.TVLibrary == "" {
+		m.statusMsg = "Configure Plex libraries in Settings (c) first"
+		return m, handled()
+	}
+
+	// Validate that library paths exist and are directories
+	if info, err := os.Stat(m.cfg.Plex.MovieLibrary); err != nil {
+		m.statusMsg = fmt.Sprintf("Movie library not found: %s", m.cfg.Plex.MovieLibrary)
+		return m, handled()
+	} else if !info.IsDir() {
+		m.statusMsg = "Movie library path is not a directory"
+		return m, handled()
+	}
+
+	if info, err := os.Stat(m.cfg.Plex.TVLibrary); err != nil {
+		m.statusMsg = fmt.Sprintf("TV library not found: %s", m.cfg.Plex.TVLibrary)
+		return m, handled()
+	} else if !info.IsDir() {
+		m.statusMsg = "TV library path is not a directory"
+		return m, handled()
+	}
+
+	if len(m.completed) == 0 || m.dlCursor >= len(m.completed) {
+		return m, handled()
+	}
+
+	t := m.completed[m.dlCursor]
+	sourcePath := filepath.Join(t.SavePath, t.Name)
+
+	// Run detection
+	detection, _ := plex.DetectFromPath(sourcePath)
+	if detection.Type == plex.MediaTypeUnknown {
+		// Default to movie if detection failed
+		detection.Type = plex.MediaTypeMovie
+		detection.Title = plex.SanitizeFilename(t.Name)
+	}
+
+	m.showMoveModal = true
+	m.moveDetection = detection
+	m.moveMediaType = detection.Type
+	m.moveSourcePath = sourcePath
+	m.moveCleanup = true
+	m.moveError = ""
+	m.moveInProgress = false
+	m.moveProgress = 0
+
+	// Initialize title input
+	m.moveTitleInput = textinput.New()
+	m.moveTitleInput.SetValue(detection.Title)
+	m.moveTitleInput.CharLimit = 200
+	m.moveTitleInput.Width = 50
+
+	// Find subtitles
+	m.moveSubtitles = plex.FindSubtitles(sourcePath)
+
+	// Generate destination preview
+	m.updateMoveDestPreview()
+
+	return m, handled()
+}
+
+// updateMoveDestPreview updates the destination preview based on current settings
+func (m *Model) updateMoveDestPreview() {
+	ext := ".mkv" // Default extension
+	if video, err := plex.FindMainVideo(m.moveSourcePath); err == nil {
+		ext = filepath.Ext(video)
+	}
+
+	title := m.moveTitleInput.Value()
+	if title == "" {
+		title = m.moveDetection.Title
+	}
+
+	switch m.moveMediaType {
+	case plex.MediaTypeMovie:
+		if m.moveDetection.Year > 0 {
+			m.moveDestPreview = filepath.Join(
+				m.cfg.Plex.MovieLibrary,
+				fmt.Sprintf("%s (%d)", title, m.moveDetection.Year),
+				fmt.Sprintf("%s (%d)%s", title, m.moveDetection.Year, ext),
+			)
+		} else {
+			m.moveDestPreview = filepath.Join(m.cfg.Plex.MovieLibrary, title, title+ext)
+		}
+	case plex.MediaTypeTV:
+		m.moveDestPreview = filepath.Join(
+			m.cfg.Plex.TVLibrary,
+			title,
+			fmt.Sprintf("Season %02d", m.moveDetection.Season),
+			filepath.Base(m.moveSourcePath),
+		)
+	}
+}
+
+// handleMoveModalKey handles keyboard input for the move modal
+func (m Model) handleMoveModalKey(key string) (tea.Model, tea.Cmd) {
+	// If editing title, handle text input
+	if m.moveEditing {
+		switch key {
+		case "esc":
+			m.moveEditing = false
+			m.moveTitleInput.Blur()
+			return m, handled()
+		case "enter":
+			m.moveEditing = false
+			m.moveTitleInput.Blur()
+			m.moveDetection.Title = m.moveTitleInput.Value()
+			m.updateMoveDestPreview()
+			return m, handled()
+		default:
+			var cmd tea.Cmd
+			m.moveTitleInput, cmd = m.moveTitleInput.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+			return m, cmd
+		}
+	}
+
+	// If move in progress, only allow escape to cancel
+	if m.moveInProgress {
+		return m, handled()
+	}
+
+	switch key {
+	case "esc", "m":
+		m.showMoveModal = false
+		return m, handled()
+
+	case "tab", "t":
+		// Toggle media type
+		if m.moveMediaType == plex.MediaTypeMovie {
+			m.moveMediaType = plex.MediaTypeTV
+		} else {
+			m.moveMediaType = plex.MediaTypeMovie
+		}
+		m.updateMoveDestPreview()
+		return m, handled()
+
+	case "i":
+		// Edit title
+		m.moveEditing = true
+		m.moveTitleInput.Focus()
+		return m, handled()
+
+	case "c":
+		// Toggle cleanup
+		m.moveCleanup = !m.moveCleanup
+		return m, handled()
+
+	case "enter":
+		// Start move operation
+		return m.startMoveOperation()
+
+	case "ctrl+c":
+		return m, tea.Quit
+	}
+
+	return m, handled()
+}
+
+// Move operation messages
+type moveProgressMsg struct {
+	progress float64
+	copied   int64
+	total    int64
+}
+
+type moveCompleteMsg struct {
+	result *plex.MoveResult
+	err    error
+}
+
+// startMoveOperation begins the async move operation
+func (m Model) startMoveOperation() (tea.Model, tea.Cmd) {
+	m.moveInProgress = true
+	m.moveProgress = 0
+	m.moveError = ""
+
+	// Get file size for progress tracking
+	if video, err := plex.FindMainVideo(m.moveSourcePath); err == nil {
+		if info, err := os.Stat(video); err == nil {
+			m.moveTotalBytes = info.Size()
+		}
+	}
+
+	// Build detection with current settings
+	detection := m.moveDetection
+	detection.Type = m.moveMediaType
+	detection.Title = m.moveTitleInput.Value()
+
+	sourcePath := m.moveSourcePath
+	cleanup := m.moveCleanup
+	movieLib := m.cfg.Plex.MovieLibrary
+	tvLib := m.cfg.Plex.TVLibrary
+	useSudo := m.cfg.Plex.UseSudo
+
+	return m, func() tea.Msg {
+		mover := plex.NewMover(plex.MoveConfig{
+			MovieLibraryPath: movieLib,
+			TVLibraryPath:    tvLib,
+			UseSudo:          useSudo,
+		})
+
+		// Create progress channel
+		progressChan := make(chan plex.MoveProgress, 10)
+		defer close(progressChan)
+
+		// Run move in goroutine
+		resultChan := make(chan struct {
+			result *plex.MoveResult
+			err    error
+		}, 1)
+
+		go func() {
+			result, err := mover.MoveToLibraryWithProgress(
+				context.Background(),
+				sourcePath,
+				detection,
+				cleanup,
+				progressChan,
+			)
+			resultChan <- struct {
+				result *plex.MoveResult
+				err    error
+			}{result, err}
+		}()
+
+		// Wait for completion (progress updates are handled by rsync parsing)
+		res := <-resultChan
+		return moveCompleteMsg{result: res.result, err: res.err}
+	}
 }
 
 func (m Model) checkQbitStatus() tea.Cmd {
@@ -1479,11 +1880,14 @@ func (m Model) View() string {
 	baseContent := b.String()
 
 	// Overlay modal if active
+	if m.showMoveModal {
+		return m.overlayModal(baseContent, m.renderMoveModal())
+	}
 	if m.showSettings {
-		return baseContent + "\n\n" + m.renderSettingsModal()
+		return m.overlayModal(baseContent, m.renderSettingsModal())
 	}
 	if m.confirmingQuit {
-		return baseContent + "\n\n" + m.renderQuitModal()
+		return m.overlayModal(baseContent, m.renderQuitModal())
 	}
 
 	return baseContent
@@ -1563,17 +1967,180 @@ func (m Model) renderQuitModal() string {
 	return modalStyle.Render(modalContent)
 }
 
-// renderSettingsModal renders the settings configuration modal
-func (m Model) renderSettingsModal() string {
+// renderMoveModal renders the move to Plex modal
+func (m Model) renderMoveModal() string {
 	styles := GetStyles()
 
-	// Modal container style
+	// Fixed size modal for consistent window feel
 	modalStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color(theme.CurrentPalette.Accent)).
 		Background(lipgloss.Color(theme.CurrentPalette.BG)).
 		Padding(1, 2).
-		Width(70)
+		Width(70).
+		Height(18)
+
+	var content strings.Builder
+	content.WriteString(styles.Title.Render("Move to Plex"))
+	content.WriteString("\n\n")
+
+	// Media type toggle
+	movieLabel := " Movie "
+	tvLabel := " TV "
+	if m.moveMediaType == plex.MediaTypeMovie {
+		movieLabel = styles.Title.Render("[Movie]")
+		tvLabel = styles.Muted.Render(" TV ")
+	} else {
+		movieLabel = styles.Muted.Render(" Movie ")
+		tvLabel = styles.Title.Render("[TV]")
+	}
+	content.WriteString(fmt.Sprintf("  Type:        %s  %s\n", movieLabel, tvLabel))
+
+	// Title (editable)
+	if m.moveEditing {
+		content.WriteString(fmt.Sprintf("  Title:       %s\n", m.moveTitleInput.View()))
+	} else {
+		titleStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color(theme.CurrentPalette.Accent)).
+			Bold(true)
+		content.WriteString(fmt.Sprintf("  Title:       %s\n", titleStyle.Render(m.moveDetection.Title)))
+	}
+
+	// Year/Season info
+	if m.moveMediaType == plex.MediaTypeMovie {
+		if m.moveDetection.Year > 0 {
+			content.WriteString(fmt.Sprintf("  Year:        %d\n", m.moveDetection.Year))
+		}
+	} else {
+		content.WriteString(fmt.Sprintf("  Season:      %d  Episode: %d\n",
+			m.moveDetection.Season, m.moveDetection.Episode))
+	}
+
+	content.WriteString("\n")
+
+	// Source path
+	content.WriteString(fmt.Sprintf("  Source:      %s\n",
+		styles.Muted.Render(TruncateString(m.moveSourcePath, 52))))
+
+	// Destination preview
+	content.WriteString(fmt.Sprintf("  Destination: %s\n",
+		styles.VPNConnected.Render(TruncateString(m.moveDestPreview, 52))))
+
+	// Subtitles count
+	if len(m.moveSubtitles) > 0 {
+		content.WriteString(fmt.Sprintf("  Subtitles:   %d files found\n", len(m.moveSubtitles)))
+	}
+
+	content.WriteString("\n")
+
+	// Cleanup toggle
+	cleanupStr := "  [ ] Delete source after move"
+	if m.moveCleanup {
+		cleanupStr = "  [×] Delete source after move"
+	}
+	content.WriteString(styles.Muted.Render(cleanupStr))
+	content.WriteString("\n\n")
+
+	// Progress bar (if moving)
+	if m.moveInProgress {
+		content.WriteString(m.renderProgressBar())
+		content.WriteString("\n")
+	} else if m.moveError != "" {
+		content.WriteString(styles.Error.Render("  " + m.moveError))
+		content.WriteString("\n")
+	}
+
+	// Help text
+	if m.moveEditing {
+		content.WriteString(styles.Muted.Render("  [esc]Cancel  [enter]Save"))
+	} else if m.moveInProgress {
+		content.WriteString(styles.Muted.Render("  Transfer in progress..."))
+	} else {
+		content.WriteString(styles.Muted.Render("  [tab]Type  [i]Edit  [c]Cleanup  [enter]Move  [esc]Cancel"))
+	}
+
+	return modalStyle.Render(content.String())
+}
+
+// renderProgressBar renders a truecolor gradient progress bar (sunset palette)
+func (m Model) renderProgressBar() string {
+	width := 50
+	filled := int(m.moveProgress * float64(width))
+	if filled > width {
+		filled = width
+	}
+
+	var bar strings.Builder
+	bar.WriteString("  [")
+
+	// Render filled portion with sunset gradient (dark rust -> golden yellow)
+	for i := 0; i < filled; i++ {
+		color := progressGradientColor(i, filled)
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
+		bar.WriteString(style.Render("█"))
+	}
+
+	// Render empty portion
+	emptyStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(theme.CurrentPalette.Muted))
+	for i := filled; i < width; i++ {
+		bar.WriteString(emptyStyle.Render("░"))
+	}
+
+	bar.WriteString("] ")
+
+	// Percentage and size
+	pct := int(m.moveProgress * 100)
+	bar.WriteString(fmt.Sprintf("%3d%%", pct))
+
+	if m.moveTotalBytes > 0 {
+		bar.WriteString(fmt.Sprintf(" - %s / %s",
+			formatSize(m.moveCopiedBytes),
+			formatSize(m.moveTotalBytes)))
+	}
+
+	return bar.String()
+}
+
+// progressGradientColor returns a color for the progress bar gradient.
+// Goes from dark rust (#8B2500) at start to golden yellow (#FFCC00) at end.
+func progressGradientColor(pos, total int) string {
+	if total <= 0 {
+		total = 1
+	}
+	ratio := float64(pos) / float64(total)
+
+	// Dark rust (#8B2500) -> Orange (#FF6B35) -> Golden yellow (#FFCC00)
+	var r, g, b float64
+
+	if ratio < 0.5 {
+		// Dark rust to orange
+		t := ratio / 0.5
+		r = 139 + t*(255-139)
+		g = 37 + t*(107-37)
+		b = 0 + t*(53-0)
+	} else {
+		// Orange to golden yellow
+		t := (ratio - 0.5) / 0.5
+		r = 255 + t*(255-255)
+		g = 107 + t*(204-107)
+		b = 53 + t*(0-53)
+	}
+
+	return fmt.Sprintf("#%02X%02X%02X", int(r), int(g), int(b))
+}
+
+// renderSettingsModal renders the settings configuration modal
+func (m Model) renderSettingsModal() string {
+	styles := GetStyles()
+
+	// Modal container style - fixed size based on largest section (qBittorrent: 4 fields)
+	modalStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(theme.CurrentPalette.Accent)).
+		Background(lipgloss.Color(theme.CurrentPalette.BG)).
+		Padding(1, 2).
+		Width(70).
+		Height(14)
 
 	// Section tab styles
 	activeTabStyle := lipgloss.NewStyle().
@@ -1606,7 +2173,7 @@ func (m Model) renderSettingsModal() string {
 		0: {"Host", "Port", "Username", "Password"},
 		1: {"Download Path"},
 		2: {"Status Script", "Connect Script"},
-		3: {"Movie Library", "TV Library"},
+		3: {"Movie Library", "TV Library", "Use Sudo (yes/no)"},
 	}
 
 	// Render fields for current section
@@ -1640,9 +2207,13 @@ func (m Model) renderSettingsModal() string {
 				val = strings.Repeat("•", len(val))
 			}
 			if isSelected {
-				valueStr = styles.HelpKey.Render(val)
+				// Use accent color for selected field value
+				selectedStyle := lipgloss.NewStyle().
+					Foreground(lipgloss.Color(theme.CurrentPalette.Accent)).
+					Bold(true)
+				valueStr = selectedStyle.Render(val)
 			} else {
-				valueStr = styles.TableRow.Render(val)
+				valueStr = styles.Muted.Render(val)
 			}
 		}
 

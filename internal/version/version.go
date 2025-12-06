@@ -3,7 +3,7 @@ package version
 
 // Version is the current application version.
 // Update this at logical milestones.
-const Version = "0.1.5"
+const Version = "0.1.6"
 
 // Milestones:
 // 0.1.0 - Initial repo setup, scaffolding, CI
@@ -12,6 +12,6 @@ const Version = "0.1.5"
 // 0.1.3 - In-app settings modal, fix VPN defaults, improve Downloads column alignment
 // 0.1.4 - Fix size parsing, ctrl+u clear, follow torrent feature, SEED/LEECH columns
 // 0.1.5 - Truecolor gradient header
+// 0.1.6 - Native Move to Plex, fixed-size modals, path tab completion
 // 0.2.0 - (planned) Native NordVPN integration
-// 0.3.0 - (planned) Native Plex integration
 // 1.0.0 - (planned) Feature-complete public release

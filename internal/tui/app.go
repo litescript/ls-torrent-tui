@@ -676,6 +676,18 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = viewSearch
 		return m, handled()
 
+	case "ctrl+u":
+		// Clear search and enter input mode (works from any tab)
+		m.activeTab = tabSearch
+		m.searchInput.SetValue("")
+		m.results = nil
+		m.cursor = 0
+		m.mode = viewSearch
+		m.statusMsg = ""
+		m.downloaded = make(map[string]bool)
+		m.searchInput.Focus()
+		return m, handled()
+
 	case "enter":
 		// Context-dependent enter action
 		if m.activeTab == tabSources && len(m.sources) > 0 && m.srcCursor < len(m.sources) {

@@ -350,8 +350,10 @@ func (s *GenericScraper) extractFromTables(doc *goquery.Document) []Torrent {
 					if num := parseNumber(cellText); num > 0 {
 						t.Leechers = num
 					}
-				} else if t.Size == "" && (strings.Contains(cellText, "GB") || strings.Contains(cellText, "MB") || strings.Contains(cellText, "KB")) {
-					t.Size = cellText
+				} else if t.Size == "" {
+					if size := extractSize(cellText); size != "" {
+						t.Size = size
+					}
 				}
 			})
 

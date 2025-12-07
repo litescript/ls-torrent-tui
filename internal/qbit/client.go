@@ -38,6 +38,7 @@ type TorrentInfo struct {
 	NumLeechers    int     `json:"num_leechs"`
 	State          string  `json:"state"`
 	SavePath       string  `json:"save_path"`
+	ContentPath    string  `json:"content_path"` // Full path to content (file or folder)
 	AddedOn        int64   `json:"added_on"`
 	CompletionOn   int64   `json:"completion_on"`
 	AmountLeft     int64   `json:"amount_left"`

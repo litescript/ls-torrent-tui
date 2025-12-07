@@ -2,6 +2,7 @@ package plex
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -45,6 +46,8 @@ type MoveProgress struct {
 	TotalBytes  int64
 	Percentage  float64
 	CurrentFile string
+	Rate        string // Transfer rate (e.g., "10.5MB/s")
+	ETA         string // Estimated time remaining (e.g., "0:01:23")
 }
 
 // Mover handles moving completed downloads to Plex libraries.
@@ -91,7 +94,7 @@ func (m *Mover) MoveToLibraryWithProgress(
 
 	switch detection.Type {
 	case MediaTypeMovie:
-		moviePath, err := FormatMoviePath(MovieNaming{
+		movieFilename, err := FormatMoviePath(MovieNaming{
 			Title:     detection.Title,
 			Year:      detection.Year,
 			Extension: ext,
@@ -99,8 +102,9 @@ func (m *Mover) MoveToLibraryWithProgress(
 		if err != nil {
 			return nil, fmt.Errorf("format movie path: %w", err)
 		}
-		destDir = filepath.Join(m.config.MovieLibraryPath, filepath.Dir(moviePath))
-		destFile = filepath.Join(m.config.MovieLibraryPath, moviePath)
+		// Movies go directly in the Movies folder (no subdirectory)
+		destDir = m.config.MovieLibraryPath
+		destFile = filepath.Join(m.config.MovieLibraryPath, movieFilename)
 
 	case MediaTypeTV:
 		tvDir, err := FormatTVPath(TVNaming{
@@ -118,9 +122,11 @@ func (m *Mover) MoveToLibraryWithProgress(
 		return nil, fmt.Errorf("unknown media type")
 	}
 
-	// Create destination directory
-	if err := m.mkdirAll(destDir); err != nil {
-		return nil, fmt.Errorf("create directory: %w", err)
+	// Create destination directory (skip if using sudo - rsync --mkpath handles it)
+	if !m.config.UseSudo {
+		if err := m.mkdirAll(destDir); err != nil {
+			return nil, fmt.Errorf("create directory: %w", err)
+		}
 	}
 
 	// Copy main video with rsync and progress
@@ -179,11 +185,11 @@ func (m *Mover) MoveAsTV(ctx context.Context, sourcePath string, naming TVNaming
 	return m.MoveToLibraryWithProgress(ctx, sourcePath, detection, false, nil)
 }
 
-// FindMainVideo finds the largest video file in a directory, ignoring samples.
+// FindMainVideo finds the largest video file in a directory (top level only), ignoring samples.
 func FindMainVideo(path string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return "", ErrSourceNotFound
+		return "", fmt.Errorf("source not found: %s", path)
 	}
 
 	// If it's a file, return it directly
@@ -195,35 +201,44 @@ func FindMainVideo(path string) (string, error) {
 		return "", fmt.Errorf("not a video file: %s", path)
 	}
 
-	// Walk directory to find largest video file
+	// Read directory entries (top level only, like script's -maxdepth 1)
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return "", fmt.Errorf("cannot read directory: %w", err)
+	}
+
 	var largest string
 	var largestSize int64
+	var filesFound []string
 
-	err = filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			return nil
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
 		}
 
-		ext := strings.ToLower(filepath.Ext(p))
-		name := strings.ToLower(info.Name())
+		name := entry.Name()
+		ext := strings.ToLower(filepath.Ext(name))
+		filesFound = append(filesFound, name)
 
 		// Skip sample files
-		if strings.Contains(name, "sample") {
-			return nil
+		if strings.Contains(strings.ToLower(name), "sample") {
+			continue
 		}
 
-		if videoExtensions[ext] && info.Size() > largestSize {
-			largestSize = info.Size()
-			largest = p
+		if videoExtensions[ext] {
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			if info.Size() > largestSize {
+				largestSize = info.Size()
+				largest = filepath.Join(path, name)
+			}
 		}
-		return nil
-	})
-
-	if err != nil {
-		return "", err
 	}
+
 	if largest == "" {
-		return "", fmt.Errorf("no video files found in %s", path)
+		return "", fmt.Errorf("no video files (.mkv/.mp4/.avi) in %s - found: %v", path, filesFound)
 	}
 	return largest, nil
 }
@@ -263,21 +278,26 @@ func FindSubtitles(path string) []string {
 	return subs
 }
 
-// mkdirAll creates a directory, using sudo if configured.
+// mkdirAll creates a directory, trying without sudo first.
 func (m *Mover) mkdirAll(path string) error {
+	// Try regular mkdir first
+	if err := os.MkdirAll(path, 0755); err == nil {
+		return nil
+	}
+	// Fall back to sudo mkdir if regular fails and sudo is enabled
 	if m.config.UseSudo {
-		cmd := exec.Command("sudo", "mkdir", "-p", path)
-		return cmd.Run()
+		return exec.Command("sudo", "-n", "mkdir", "-p", path).Run()
 	}
 	return os.MkdirAll(path, 0755)
 }
 
 // rsyncFile copies a single file using rsync.
 func (m *Mover) rsyncFile(src, dst string) error {
-	args := []string{"-avh", "--inplace", src, dst}
+	args := []string{"-avh", "--inplace", "--mkpath", src, dst}
 	var cmd *exec.Cmd
 	if m.config.UseSudo {
-		cmd = exec.Command("sudo", append([]string{"rsync"}, args...)...)
+		sudoArgs := append([]string{"-n", "rsync"}, args...)
+		cmd = exec.Command("sudo", sudoArgs...)
 	} else {
 		cmd = exec.Command("rsync", args...)
 	}
@@ -291,11 +311,12 @@ func (m *Mover) rsyncWithProgress(
 	totalBytes int64,
 	progress chan<- MoveProgress,
 ) error {
-	args := []string{"-avh", "--info=progress2", "--no-inc-recursive", "--partial", "--inplace", src, dst}
+	args := []string{"-avh", "--info=progress2", "--no-inc-recursive", "--partial", "--inplace", "--mkpath", src, dst}
 
 	var cmd *exec.Cmd
 	if m.config.UseSudo {
-		cmd = exec.CommandContext(ctx, "sudo", append([]string{"rsync"}, args...)...)
+		sudoArgs := append([]string{"-n", "rsync"}, args...)
+		cmd = exec.CommandContext(ctx, "sudo", sudoArgs...)
 	} else {
 		cmd = exec.CommandContext(ctx, "rsync", args...)
 	}
@@ -306,14 +327,23 @@ func (m *Mover) rsyncWithProgress(
 		return err
 	}
 
+	// Capture stderr for error messages
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 
 	// Parse progress from rsync output
-	// Format: "  1,234,567  12%  123.45MB/s    0:01:23"
+	// Format: "  5.70G  86%   10.12MB/s    0:00:45"
 	progressRegex := regexp.MustCompile(`(\d+)%`)
-	bytesRegex := regexp.MustCompile(`^\s*([\d,]+)`)
+	// Match human-readable sizes like "5.70G", "123.45M", "1.2K", "500"
+	bytesRegex := regexp.MustCompile(`^\s*([\d.]+)([KMGT]?)`)
+	// Match transfer rate like "10.12MB/s" or "1.5GB/s"
+	rateRegex := regexp.MustCompile(`([\d.]+[KMGT]?B/s)`)
+	// Match ETA like "0:01:23" or "0:00:45"
+	etaRegex := regexp.MustCompile(`(\d+:\d+:\d+)`)
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Split(scanRsyncLines)
@@ -325,25 +355,62 @@ func (m *Mover) rsyncWithProgress(
 		if matches := progressRegex.FindStringSubmatch(line); matches != nil {
 			pct, _ := strconv.Atoi(matches[1])
 
-			// Try to extract bytes copied
+			// Try to extract bytes copied (human-readable format)
 			var copied int64
 			if byteMatches := bytesRegex.FindStringSubmatch(line); byteMatches != nil {
-				bytesStr := strings.ReplaceAll(byteMatches[1], ",", "")
-				copied, _ = strconv.ParseInt(bytesStr, 10, 64)
+				value, _ := strconv.ParseFloat(byteMatches[1], 64)
+				suffix := byteMatches[2]
+				switch suffix {
+				case "K":
+					copied = int64(value * 1024)
+				case "M":
+					copied = int64(value * 1024 * 1024)
+				case "G":
+					copied = int64(value * 1024 * 1024 * 1024)
+				case "T":
+					copied = int64(value * 1024 * 1024 * 1024 * 1024)
+				default:
+					copied = int64(value)
+				}
+			}
+
+			// Extract rate
+			var rate string
+			if rateMatches := rateRegex.FindStringSubmatch(line); rateMatches != nil {
+				rate = rateMatches[1]
+			}
+
+			// Extract ETA
+			var eta string
+			if etaMatches := etaRegex.FindStringSubmatch(line); etaMatches != nil {
+				eta = etaMatches[1]
 			}
 
 			if progress != nil {
-				progress <- MoveProgress{
+				// Non-blocking send to prevent rsync from hanging
+				select {
+				case progress <- MoveProgress{
 					BytesCopied: copied,
 					TotalBytes:  totalBytes,
 					Percentage:  float64(pct) / 100.0,
 					CurrentFile: filepath.Base(src),
+					Rate:        rate,
+					ETA:         eta,
+				}:
+				default:
+					// Channel full, skip this update
 				}
 			}
 		}
 	}
 
-	return cmd.Wait()
+	if err := cmd.Wait(); err != nil {
+		if stderrBuf.Len() > 0 {
+			return fmt.Errorf("%w: %s", err, stderrBuf.String())
+		}
+		return err
+	}
+	return nil
 }
 
 // scanRsyncLines is a custom scanner that handles rsync's carriage return progress updates.
@@ -368,21 +435,14 @@ func scanRsyncLines(data []byte, atEOF bool) (advance int, token []byte, err err
 }
 
 // cleanupSource removes source files after successful move.
+// Note: No sudo needed - these are the user's own downloaded files.
 func (m *Mover) cleanupSource(basePath, mainVideo string, subtitles []string) {
 	// Remove main video
-	if m.config.UseSudo {
-		exec.Command("sudo", "rm", "-f", mainVideo).Run()
-	} else {
-		os.Remove(mainVideo)
-	}
+	os.Remove(mainVideo)
 
 	// Remove subtitles
 	for _, sub := range subtitles {
-		if m.config.UseSudo {
-			exec.Command("sudo", "rm", "-f", sub).Run()
-		} else {
-			os.Remove(sub)
-		}
+		os.Remove(sub)
 	}
 
 	// Try to remove empty directory
@@ -391,11 +451,7 @@ func (m *Mover) cleanupSource(basePath, mainVideo string, subtitles []string) {
 		// Check if empty
 		entries, _ := os.ReadDir(basePath)
 		if len(entries) == 0 {
-			if m.config.UseSudo {
-				exec.Command("sudo", "rmdir", basePath).Run()
-			} else {
-				os.Remove(basePath)
-			}
+			os.Remove(basePath)
 		}
 	}
 }

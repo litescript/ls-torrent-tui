@@ -131,6 +131,10 @@ type Model struct {
 	moveError       string               // Error message if move failed
 	moveTotalBytes  int64                // Total bytes to transfer
 	moveCopiedBytes int64                // Bytes copied so far
+	moveRate        string               // Transfer rate (e.g., "10.5MB/s")
+	moveETA         string               // Estimated time remaining (e.g., "0:01:23")
+	moveShimmerPos  int                  // Shimmer animation position (-1 = inactive)
+	moveComplete    bool                 // Move finished successfully
 
 	// Dimensions
 	width  int
@@ -444,16 +448,46 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = fmt.Sprintf("Added source: %s%s", msg.name, msg.warning)
 		}
 
+	case moveProgressMsg:
+		if msg.progress >= 0 {
+			m.moveProgress = msg.progress
+			m.moveCopiedBytes = msg.copied
+			if msg.total > 0 {
+				m.moveTotalBytes = msg.total
+			}
+			if msg.rate != "" {
+				m.moveRate = msg.rate
+			}
+			if msg.eta != "" {
+				m.moveETA = msg.eta
+			}
+		}
+		// Keep ticking while move is in progress
+		if m.moveInProgress {
+			return m, m.tickMoveProgress()
+		}
+
 	case moveCompleteMsg:
 		m.moveInProgress = false
 		if msg.err != nil {
 			m.moveError = msg.err.Error()
 		} else {
-			m.showMoveModal = false
+			// Show success in modal - user presses esc to close
+			m.moveError = fmt.Sprintf("✓ Moved to: %s", msg.result.DestinationPath)
 			m.statusMsg = fmt.Sprintf("Moved to Plex: %s", TruncateString(msg.result.DestinationPath, 40))
-			// Refresh torrent list to reflect changes
-			return m, m.fetchTorrents()
+			m.moveComplete = true
+			// Start shimmer animation
+			m.moveShimmerPos = 0
+			return m, m.tickMoveShimmer()
 		}
+
+	case moveShimmerTickMsg:
+		if m.moveShimmerPos >= 0 && m.moveShimmerPos < 100 {
+			m.moveShimmerPos += 4 // Speed of shimmer
+			return m, m.tickMoveShimmer()
+		}
+		// Shimmer complete
+		m.moveShimmerPos = -1
 
 	case torrentListMsg:
 		m.isFetching = false // Clear guard regardless of success/failure
@@ -1445,7 +1479,12 @@ func (m Model) openMoveModal() (tea.Model, tea.Cmd) {
 	}
 
 	t := m.completed[m.dlCursor]
-	sourcePath := filepath.Join(t.SavePath, t.Name)
+	// Use ContentPath from qBittorrent (full path to content)
+	// Fall back to SavePath + Name if ContentPath is empty
+	sourcePath := t.ContentPath
+	if sourcePath == "" {
+		sourcePath = filepath.Join(t.SavePath, t.Name)
+	}
 
 	// Run detection
 	detection, _ := plex.DetectFromPath(sourcePath)
@@ -1459,10 +1498,12 @@ func (m Model) openMoveModal() (tea.Model, tea.Cmd) {
 	m.moveDetection = detection
 	m.moveMediaType = detection.Type
 	m.moveSourcePath = sourcePath
-	m.moveCleanup = true
+	m.moveCleanup = false // Default OFF - user must explicitly enable
 	m.moveError = ""
 	m.moveInProgress = false
 	m.moveProgress = 0
+	m.moveComplete = false
+	m.moveShimmerPos = -1
 
 	// Initialize title input
 	m.moveTitleInput = textinput.New()
@@ -1493,14 +1534,14 @@ func (m *Model) updateMoveDestPreview() {
 
 	switch m.moveMediaType {
 	case plex.MediaTypeMovie:
+		// Movies go directly in Movies/ folder (no subdirectory)
 		if m.moveDetection.Year > 0 {
 			m.moveDestPreview = filepath.Join(
 				m.cfg.Plex.MovieLibrary,
-				fmt.Sprintf("%s (%d)", title, m.moveDetection.Year),
 				fmt.Sprintf("%s (%d)%s", title, m.moveDetection.Year, ext),
 			)
 		} else {
-			m.moveDestPreview = filepath.Join(m.cfg.Plex.MovieLibrary, title, title+ext)
+			m.moveDestPreview = filepath.Join(m.cfg.Plex.MovieLibrary, title+ext)
 		}
 	case plex.MediaTypeTV:
 		m.moveDestPreview = filepath.Join(
@@ -1581,6 +1622,8 @@ type moveProgressMsg struct {
 	progress float64
 	copied   int64
 	total    int64
+	rate     string
+	eta      string
 }
 
 type moveCompleteMsg struct {
@@ -1588,10 +1631,30 @@ type moveCompleteMsg struct {
 	err    error
 }
 
+type moveShimmerTickMsg struct{}
+
+// Shared move progress state for async updates
+var (
+	moveProgressChan   chan plex.MoveProgress
+	moveResultChan     chan moveCompleteMsg
+	moveProgressActive bool
+)
+
 // startMoveOperation begins the async move operation
 func (m Model) startMoveOperation() (tea.Model, tea.Cmd) {
+	// Check if sudo rsync is available without password (if UseSudo is enabled)
+	if m.cfg.Plex.UseSudo {
+		if err := exec.Command("sudo", "-n", "rsync", "--version").Run(); err != nil {
+			m.moveError = "Sudo requires password. Add to sudoers: username ALL=(ALL) NOPASSWD: /usr/bin/rsync"
+			return m, handled()
+		}
+	}
+
 	m.moveInProgress = true
 	m.moveProgress = 0
+	m.moveCopiedBytes = 0
+	m.moveRate = ""
+	m.moveETA = ""
 	m.moveError = ""
 
 	// Get file size for progress tracking
@@ -1612,41 +1675,76 @@ func (m Model) startMoveOperation() (tea.Model, tea.Cmd) {
 	tvLib := m.cfg.Plex.TVLibrary
 	useSudo := m.cfg.Plex.UseSudo
 
-	return m, func() tea.Msg {
+	// Create channels for progress and result
+	moveProgressChan = make(chan plex.MoveProgress, 100)
+	moveResultChan = make(chan moveCompleteMsg, 1)
+	moveProgressActive = true
+
+	// Start move in background goroutine
+	go func() {
 		mover := plex.NewMover(plex.MoveConfig{
 			MovieLibraryPath: movieLib,
 			TVLibraryPath:    tvLib,
 			UseSudo:          useSudo,
 		})
 
-		// Create progress channel
-		progressChan := make(chan plex.MoveProgress, 10)
-		defer close(progressChan)
+		result, err := mover.MoveToLibraryWithProgress(
+			context.Background(),
+			sourcePath,
+			detection,
+			cleanup,
+			moveProgressChan,
+		)
+		moveResultChan <- moveCompleteMsg{result: result, err: err}
+		close(moveProgressChan)
+		moveProgressActive = false
+	}()
 
-		// Run move in goroutine
-		resultChan := make(chan struct {
-			result *plex.MoveResult
-			err    error
-		}, 1)
+	// Return tick command to poll for progress
+	return m, m.tickMoveProgress()
+}
 
-		go func() {
-			result, err := mover.MoveToLibraryWithProgress(
-				context.Background(),
-				sourcePath,
-				detection,
-				cleanup,
-				progressChan,
-			)
-			resultChan <- struct {
-				result *plex.MoveResult
-				err    error
-			}{result, err}
-		}()
+// tickMoveProgress returns a command that checks for progress updates
+func (m Model) tickMoveProgress() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+		// Check for completion first
+		select {
+		case result := <-moveResultChan:
+			return result
+		default:
+		}
 
-		// Wait for completion (progress updates are handled by rsync parsing)
-		res := <-resultChan
-		return moveCompleteMsg{result: res.result, err: res.err}
-	}
+		// Check for progress updates
+		var lastProgress plex.MoveProgress
+		hasProgress := false
+		for {
+			select {
+			case p, ok := <-moveProgressChan:
+				if ok {
+					lastProgress = p
+					hasProgress = true
+				}
+			default:
+				if hasProgress {
+					return moveProgressMsg{
+						progress: lastProgress.Percentage,
+						copied:   lastProgress.BytesCopied,
+						total:    lastProgress.TotalBytes,
+						rate:     lastProgress.Rate,
+						eta:      lastProgress.ETA,
+					}
+				}
+				// No updates, just tick again
+				return moveProgressMsg{progress: -1} // Signal to keep ticking
+			}
+		}
+	})
+}
+
+func (m Model) tickMoveShimmer() tea.Cmd {
+	return tea.Tick(30*time.Millisecond, func(t time.Time) tea.Msg {
+		return moveShimmerTickMsg{}
+	})
 }
 
 func (m Model) checkQbitStatus() tea.Cmd {
@@ -1977,7 +2075,7 @@ func (m Model) renderMoveModal() string {
 		BorderForeground(lipgloss.Color(theme.CurrentPalette.Accent)).
 		Background(lipgloss.Color(theme.CurrentPalette.BG)).
 		Padding(1, 2).
-		Width(70).
+		Width(80).
 		Height(18)
 
 	var content strings.Builder
@@ -2018,13 +2116,13 @@ func (m Model) renderMoveModal() string {
 
 	content.WriteString("\n")
 
-	// Source path
+	// Source path (label is 15 chars, so path can be ~58 chars in 80-wide modal)
 	content.WriteString(fmt.Sprintf("  Source:      %s\n",
-		styles.Muted.Render(TruncateString(m.moveSourcePath, 52))))
+		styles.Muted.Render(TruncateString(m.moveSourcePath, 58))))
 
 	// Destination preview
 	content.WriteString(fmt.Sprintf("  Destination: %s\n",
-		styles.VPNConnected.Render(TruncateString(m.moveDestPreview, 52))))
+		styles.VPNConnected.Render(TruncateString(m.moveDestPreview, 58))))
 
 	// Subtitles count
 	if len(m.moveSubtitles) > 0 {
@@ -2041,12 +2139,18 @@ func (m Model) renderMoveModal() string {
 	content.WriteString(styles.Muted.Render(cleanupStr))
 	content.WriteString("\n\n")
 
-	// Progress bar (if moving)
+	// Status message
 	if m.moveInProgress {
+		// Show live progress bar
 		content.WriteString(m.renderProgressBar())
 		content.WriteString("\n")
 	} else if m.moveError != "" {
-		content.WriteString(styles.Error.Render("  " + m.moveError))
+		// Check if it's a success message (starts with checkmark)
+		if strings.HasPrefix(m.moveError, "✓") {
+			content.WriteString(styles.VPNConnected.Render("  " + m.moveError))
+		} else {
+			content.WriteString(styles.Error.Render("  " + m.moveError))
+		}
 		content.WriteString("\n")
 	}
 
@@ -2054,17 +2158,26 @@ func (m Model) renderMoveModal() string {
 	if m.moveEditing {
 		content.WriteString(styles.Muted.Render("  [esc]Cancel  [enter]Save"))
 	} else if m.moveInProgress {
-		content.WriteString(styles.Muted.Render("  Transfer in progress..."))
+		content.WriteString(styles.Muted.Render("  Please wait..."))
+	} else if m.moveComplete {
+		content.WriteString(styles.Muted.Render("  [esc] Close"))
 	} else {
 		content.WriteString(styles.Muted.Render("  [tab]Type  [i]Edit  [c]Cleanup  [enter]Move  [esc]Cancel"))
 	}
 
-	return modalStyle.Render(content.String())
+	rendered := modalStyle.Render(content.String())
+
+	// Apply shimmer effect on successful completion
+	if m.moveShimmerPos >= 0 {
+		rendered = m.applyShimmer(rendered)
+	}
+
+	return rendered
 }
 
 // renderProgressBar renders a truecolor gradient progress bar (sunset palette)
 func (m Model) renderProgressBar() string {
-	width := 50
+	width := 68 // Full width bar, info goes underneath
 	filled := int(m.moveProgress * float64(width))
 	if filled > width {
 		filled = width
@@ -2086,17 +2199,28 @@ func (m Model) renderProgressBar() string {
 		bar.WriteString(emptyStyle.Render("░"))
 	}
 
-	bar.WriteString("] ")
+	bar.WriteString("]\n")
 
-	// Percentage and size
-	pct := int(m.moveProgress * 100)
-	bar.WriteString(fmt.Sprintf("%3d%%", pct))
+	// Progress info on second line
+	pct := m.moveProgress * 100
+	var info strings.Builder
+	info.WriteString(fmt.Sprintf("  %5.1f%%", pct))
 
 	if m.moveTotalBytes > 0 {
-		bar.WriteString(fmt.Sprintf(" - %s / %s",
+		info.WriteString(fmt.Sprintf("  •  %s / %s",
 			formatSize(m.moveCopiedBytes),
 			formatSize(m.moveTotalBytes)))
 	}
+
+	if m.moveRate != "" {
+		info.WriteString(fmt.Sprintf("  •  %s", m.moveRate))
+	}
+
+	if m.moveETA != "" {
+		info.WriteString(fmt.Sprintf("  •  ETA %s", m.moveETA))
+	}
+
+	bar.WriteString(info.String())
 
 	return bar.String()
 }
@@ -2129,6 +2253,41 @@ func progressGradientColor(pos, total int) string {
 	return fmt.Sprintf("#%02X%02X%02X", int(r), int(g), int(b))
 }
 
+// applyShimmer applies a sweeping shimmer effect across the rendered content.
+// The shimmer brightens characters to a success green color as it passes.
+func (m Model) applyShimmer(content string) string {
+	// Bright success green color
+	shimmerColor := "#50FA7B"
+
+	var result strings.Builder
+	lines := strings.Split(content, "\n")
+
+	// Modal is ~80 chars wide, shimmer sweeps left to right
+	shimmerWidth := 8 // Width of the shimmer band
+	shimmerPos := m.moveShimmerPos
+
+	for lineIdx, line := range lines {
+		runes := []rune(line)
+		for i, r := range runes {
+			// Calculate horizontal position relative to shimmer
+			distFromShimmer := i - shimmerPos
+
+			if distFromShimmer >= 0 && distFromShimmer < shimmerWidth {
+				// Character is within shimmer band - apply green
+				style := lipgloss.NewStyle().Foreground(lipgloss.Color(shimmerColor))
+				result.WriteString(style.Render(string(r)))
+			} else {
+				result.WriteRune(r)
+			}
+		}
+		if lineIdx < len(lines)-1 {
+			result.WriteString("\n")
+		}
+	}
+
+	return result.String()
+}
+
 // renderSettingsModal renders the settings configuration modal
 func (m Model) renderSettingsModal() string {
 	styles := GetStyles()
@@ -2139,7 +2298,7 @@ func (m Model) renderSettingsModal() string {
 		BorderForeground(lipgloss.Color(theme.CurrentPalette.Accent)).
 		Background(lipgloss.Color(theme.CurrentPalette.BG)).
 		Padding(1, 2).
-		Width(70).
+		Width(80).
 		Height(14)
 
 	// Section tab styles

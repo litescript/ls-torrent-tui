@@ -28,8 +28,8 @@ type TVNaming struct {
 	Extension    string
 }
 
-// FormatMoviePath generates a Plex-compatible path for a movie.
-// Returns: "Title (Year)/Title (Year).ext"
+// FormatMoviePath generates a Plex-compatible filename for a movie.
+// Returns: "Title (Year).ext" (directly in Movies folder, like the bash script)
 func FormatMoviePath(m MovieNaming) (string, error) {
 	if m.Title == "" {
 		return "", ErrInvalidInput
@@ -37,16 +37,10 @@ func FormatMoviePath(m MovieNaming) (string, error) {
 
 	title := SanitizeFilename(m.Title)
 
-	var folderName, fileName string
 	if m.Year > 0 {
-		folderName = fmt.Sprintf("%s (%d)", title, m.Year)
-		fileName = fmt.Sprintf("%s (%d)%s", title, m.Year, m.Extension)
-	} else {
-		folderName = title
-		fileName = title + m.Extension
+		return fmt.Sprintf("%s (%d)%s", title, m.Year, m.Extension), nil
 	}
-
-	return filepath.Join(folderName, fileName), nil
+	return title + m.Extension, nil
 }
 
 // FormatTVPath generates a Plex-compatible directory path for a TV episode.

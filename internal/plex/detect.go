@@ -176,7 +176,8 @@ func cleanTitle(raw string) string {
 
 	// Remove common release tags that might be left at the end
 	// (These often appear between title and year/episode)
-	cleaned = strings.TrimRight(cleaned, " -")
+	// Also trim opening parenthesis/bracket that precedes year
+	cleaned = strings.TrimRight(cleaned, " -([{")
 
 	// Collapse multiple spaces
 	spacePattern := regexp.MustCompile(`\s+`)

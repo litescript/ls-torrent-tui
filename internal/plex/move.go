@@ -38,6 +38,8 @@ type MoveResult struct {
 	BytesMoved      int64
 	Success         bool
 	Error           error
+	RemainingFiles  []string // Files left in source directory (for cleanup prompt)
+	SourceDir       string   // Source directory path (for cleanup)
 }
 
 // MoveProgress reports progress during a move operation.
@@ -141,9 +143,20 @@ func (m *Mover) MoveToLibraryWithProgress(
 		_ = m.rsyncFile(sub, subDest) // Non-fatal if subtitle copy fails
 	}
 
-	// Cleanup source if requested
-	if cleanup {
-		m.cleanupSource(sourcePath, mainVideo, subtitles)
+	// Determine source directory and whether cleanup makes sense
+	sourceDir := sourcePath
+	srcInfo, _ := os.Stat(sourcePath)
+	sourceIsDir := srcInfo != nil && srcInfo.IsDir()
+	if !sourceIsDir {
+		sourceDir = filepath.Dir(sourcePath)
+	}
+
+	// Find remaining files if cleanup requested AND source was a directory.
+	// Single-file torrents (sourcePath is a file) don't have their own folder,
+	// so cleanup would incorrectly show sibling torrents in the downloads dir.
+	var remaining []string
+	if cleanup && sourceIsDir {
+		remaining = m.findRemainingFiles(sourceDir, mainVideo, subtitles)
 	}
 
 	return &MoveResult{
@@ -152,6 +165,8 @@ func (m *Mover) MoveToLibraryWithProgress(
 		MediaType:       detection.Type,
 		BytesMoved:      totalBytes,
 		Success:         true,
+		RemainingFiles:  remaining,
+		SourceDir:       sourceDir,
 	}, nil
 }
 
@@ -387,6 +402,14 @@ func (m *Mover) rsyncWithProgress(
 			}
 
 			if progress != nil {
+				// Clamp values to avoid rsync protocol overhead showing >100%
+				if copied > totalBytes {
+					copied = totalBytes
+				}
+				if pct > 100 {
+					pct = 100
+				}
+
 				// Non-blocking send to prevent rsync from hanging
 				select {
 				case progress <- MoveProgress{
@@ -434,26 +457,45 @@ func scanRsyncLines(data []byte, atEOF bool) (advance int, token []byte, err err
 	return 0, nil, nil
 }
 
-// cleanupSource removes source files after successful move.
-// Note: No sudo needed - these are the user's own downloaded files.
-func (m *Mover) cleanupSource(basePath, mainVideo string, subtitles []string) {
-	// Remove main video
-	os.Remove(mainVideo)
-
-	// Remove subtitles
-	for _, sub := range subtitles {
-		os.Remove(sub)
+// findRemainingFiles returns all files in the source directory except the moved video and subtitles.
+// These are the "cruft" files like NFOs, samples, screenshots, etc.
+func (m *Mover) findRemainingFiles(sourceDir, mainVideo string, subtitles []string) []string {
+	info, err := os.Stat(sourceDir)
+	if err != nil || !info.IsDir() {
+		return nil
 	}
 
-	// Try to remove empty directory
-	info, err := os.Stat(basePath)
-	if err == nil && info.IsDir() {
-		// Check if empty
-		entries, _ := os.ReadDir(basePath)
-		if len(entries) == 0 {
-			os.Remove(basePath)
+	// Build set of moved files (use base names for comparison)
+	moved := make(map[string]bool)
+	moved[filepath.Base(mainVideo)] = true
+	for _, sub := range subtitles {
+		moved[filepath.Base(sub)] = true
+	}
+
+	var remaining []string
+	entries, _ := os.ReadDir(sourceDir)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !moved[name] {
+			remaining = append(remaining, name)
 		}
 	}
+	return remaining
+}
+
+// CleanupSourceDir removes all files and the directory itself.
+// Call this after user confirms cleanup of remaining files.
+func CleanupSourceDir(sourceDir string) error {
+	info, err := os.Stat(sourceDir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		// Single file - just remove it
+		return os.Remove(sourceDir)
+	}
+	// Remove entire directory tree
+	return os.RemoveAll(sourceDir)
 }
 
 // ValidatePath checks that a path is safe and within allowed boundaries.

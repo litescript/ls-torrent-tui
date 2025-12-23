@@ -53,6 +53,9 @@ type QBittorrentConfig struct {
 
 // VPNConfig holds VPN configuration
 type VPNConfig struct {
+	// Required determines if VPN must be connected before torrent operations.
+	// Set to false if qBittorrent is already bound to a VPN tunnel interface.
+	Required bool `toml:"required"`
 	// UseNative enables native VPN integration (future feature).
 	// When false (default), uses external scripts.
 	UseNative     bool   `toml:"use_native"`
@@ -97,6 +100,7 @@ func Default() Config {
 			Password: "adminadmin",
 		},
 		VPN: VPNConfig{
+			Required:      true,  // Require VPN by default
 			UseNative:     false, // Use scripts by default until native is implemented
 			StatusScript:  "",    // User must configure
 			ConnectScript: "",    // User must configure

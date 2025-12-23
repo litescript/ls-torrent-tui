@@ -77,8 +77,9 @@ type Model struct {
 	vpnStatus     vpn.Status
 	vpnChecked    bool // Have we done initial VPN check?
 	vpnConnecting bool // Are we currently connecting to VPN?
-	qbitOnline    bool
-	isFetching    bool // Guard against overlapping torrent fetches
+	qbitOnline     bool
+	isFetching     bool      // Guard against overlapping torrent fetches
+	fetchStartedAt time.Time // When current fetch started (for stale detection)
 
 	// Torrent lists from qBittorrent
 	downloading []qbit.TorrentInfo
@@ -133,8 +134,11 @@ type Model struct {
 	moveCopiedBytes int64                // Bytes copied so far
 	moveRate        string               // Transfer rate (e.g., "10.5MB/s")
 	moveETA         string               // Estimated time remaining (e.g., "0:01:23")
-	moveShimmerPos  int                  // Shimmer animation position (-1 = inactive)
-	moveComplete    bool                 // Move finished successfully
+	moveShimmerPos     int                  // Shimmer animation position (-1 = inactive)
+	moveComplete       bool                 // Move finished successfully
+	moveShowCleanup    bool                 // Showing cleanup confirmation?
+	moveRemainingFiles []string             // Leftover files after move
+	moveSourceDir      string               // Source directory for cleanup
 
 	// Dimensions
 	width  int
@@ -169,8 +173,9 @@ type filesLoadedMsg struct {
 }
 
 type torrentAddedMsg struct {
-	name string
-	err  error
+	name     string
+	infohash string
+	err      error
 }
 
 type vpnConnectMsg struct {
@@ -225,9 +230,9 @@ func NewModel(cfg config.Config) Model {
 	// Settings inputs (10 fields total)
 	// qBit: host, port, username, password (indices 0-3)
 	// Downloads: path (index 4)
-	// VPN: status_script, connect_script (indices 5-6)
+	// VPN: status_script, connect_script, required (indices 5-6, 10)
 	// Plex: movie_library, tv_library, use_sudo (indices 7-9)
-	settingsInputs := make([]textinput.Model, 10)
+	settingsInputs := make([]textinput.Model, 11)
 	for i := range settingsInputs {
 		settingsInputs[i] = textinput.New()
 		settingsInputs[i].CharLimit = 256
@@ -248,6 +253,11 @@ func NewModel(cfg config.Config) Model {
 		settingsInputs[9].SetValue("yes")
 	} else {
 		settingsInputs[9].SetValue("no")
+	}
+	if cfg.VPN.Required {
+		settingsInputs[10].SetValue("yes")
+	} else {
+		settingsInputs[10].SetValue("no")
 	}
 
 	// Initialize search sources from config
@@ -365,8 +375,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		wasChecked := m.vpnChecked
 		m.vpnChecked = true
 
-		// On initial check, if VPN is disconnected, show connect prompt
-		if !wasChecked && !m.vpnStatus.Connected {
+		// On initial check, if VPN is disconnected and required, show connect prompt
+		if !wasChecked && !m.vpnStatus.Connected && m.cfg.VPN.Required {
 			m.mode = viewVPNConnect
 			m.statusMsg = "VPN required - press Enter to connect or q to quit"
 			m.searchInput.Blur() // Unfocus so keys work
@@ -415,8 +425,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = fmt.Sprintf("Error: %v", msg.err)
 		} else {
 			m.statusMsg = fmt.Sprintf("Added: %s", TruncateString(msg.name, 40))
-			// Mark as downloaded so we can show indicator in results
-			m.downloaded[msg.name] = true
+			// Mark as downloaded by infohash (unique identifier)
+			key := msg.infohash
+			if key == "" {
+				key = msg.name // fallback if no infohash
+			}
+			m.downloaded[key] = true
 		}
 
 	case vpnConnectMsg:
@@ -472,13 +486,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.moveError = msg.err.Error()
 		} else {
-			// Show success in modal - user presses esc to close
-			m.moveError = fmt.Sprintf("✓ Moved to: %s", msg.result.DestinationPath)
-			m.statusMsg = fmt.Sprintf("Moved to Plex: %s", TruncateString(msg.result.DestinationPath, 40))
-			m.moveComplete = true
-			// Start shimmer animation
-			m.moveShimmerPos = 0
-			return m, m.tickMoveShimmer()
+			// Store source dir for potential cleanup
+			m.moveSourceDir = msg.result.SourceDir
+			m.moveRemainingFiles = msg.result.RemainingFiles
+
+			// Check if there are remaining files to clean up
+			if m.moveCleanup && len(msg.result.RemainingFiles) > 0 {
+				// Show cleanup confirmation prompt
+				m.moveShowCleanup = true
+				m.moveError = fmt.Sprintf("✓ Moved to: %s", msg.result.DestinationPath)
+				m.statusMsg = fmt.Sprintf("Moved to Plex: %s", TruncateString(msg.result.DestinationPath, 40))
+			} else if m.moveCleanup && len(msg.result.RemainingFiles) == 0 {
+				// No remaining files - clean up the directory immediately
+				plex.CleanupSourceDir(msg.result.SourceDir)
+				m.moveError = fmt.Sprintf("✓ Moved and cleaned up: %s", msg.result.DestinationPath)
+				m.statusMsg = fmt.Sprintf("Moved to Plex: %s", TruncateString(msg.result.DestinationPath, 40))
+				m.moveComplete = true
+				m.moveShimmerPos = 0
+				return m, m.tickMoveShimmer()
+			} else {
+				// No cleanup requested - just show success
+				m.moveError = fmt.Sprintf("✓ Moved to: %s", msg.result.DestinationPath)
+				m.statusMsg = fmt.Sprintf("Moved to Plex: %s", TruncateString(msg.result.DestinationPath, 40))
+				m.moveComplete = true
+				m.moveShimmerPos = 0
+				return m, m.tickMoveShimmer()
+			}
 		}
 
 	case moveShimmerTickMsg:
@@ -511,8 +544,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		// Periodic refresh - fetch torrents and schedule next tick
 		// Skip if a fetch is already in-flight to prevent goroutine pile-up
+		// Reset stale fetches (stuck for >30s) to prevent permanent blocking
+		if m.isFetching && !m.fetchStartedAt.IsZero() && time.Since(m.fetchStartedAt) > 30*time.Second {
+			m.isFetching = false
+		}
 		if !m.isFetching {
 			m.isFetching = true
+			m.fetchStartedAt = time.Now()
 			cmds = append(cmds, m.fetchTorrents())
 		}
 		cmds = append(cmds, tickCmd())
@@ -700,7 +738,7 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, handled()
 		case "enter":
 			if m.searchInput.Value() != "" {
-				if !m.vpnStatus.Connected {
+				if m.cfg.VPN.Required && !m.vpnStatus.Connected {
 					m.statusMsg = "VPN required! Press V to connect"
 					return m, handled()
 				}
@@ -783,7 +821,7 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, handled()
 		}
 		if m.activeTab == tabSearch && m.mode == viewResults && len(m.results) > 0 {
-			if !m.vpnStatus.Connected {
+			if m.cfg.VPN.Required && !m.vpnStatus.Connected {
 				m.statusMsg = "VPN required! Press V to connect"
 				return m, handled()
 			}
@@ -1041,6 +1079,11 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.settingsInputs[9].SetValue("no")
 		}
+		if m.cfg.VPN.Required {
+			m.settingsInputs[10].SetValue("yes")
+		} else {
+			m.settingsInputs[10].SetValue("no")
+		}
 		return m, handled()
 
 	case "/", "i": // / or i to focus search input (preserves results)
@@ -1201,7 +1244,7 @@ func settingsSectionFields(section int) []int {
 	case 1:
 		return []int{4}
 	case 2:
-		return []int{5, 6}
+		return []int{5, 6, 10}
 	case 3:
 		return []int{7, 8, 9}
 	default:
@@ -1413,6 +1456,8 @@ func (m *Model) saveSettings() {
 	m.cfg.Plex.TVLibrary = m.settingsInputs[8].Value()
 	useSudoVal := strings.ToLower(m.settingsInputs[9].Value())
 	m.cfg.Plex.UseSudo = useSudoVal == "yes" || useSudoVal == "true" || useSudoVal == "1"
+	vpnRequiredVal := strings.ToLower(m.settingsInputs[10].Value())
+	m.cfg.VPN.Required = vpnRequiredVal == "yes" || vpnRequiredVal == "true" || vpnRequiredVal == "1"
 
 	// Validate Plex library paths
 	var warnings []string
@@ -1504,6 +1549,9 @@ func (m Model) openMoveModal() (tea.Model, tea.Cmd) {
 	m.moveProgress = 0
 	m.moveComplete = false
 	m.moveShimmerPos = -1
+	m.moveShowCleanup = false
+	m.moveRemainingFiles = nil
+	m.moveSourceDir = ""
 
 	// Initialize title input
 	m.moveTitleInput = textinput.New()
@@ -1577,6 +1625,27 @@ func (m Model) handleMoveModalKey(key string) (tea.Model, tea.Cmd) {
 
 	// If move in progress, only allow escape to cancel
 	if m.moveInProgress {
+		return m, handled()
+	}
+
+	// If showing cleanup confirmation, handle y/n
+	if m.moveShowCleanup {
+		switch key {
+		case "y", "Y":
+			// User confirmed cleanup - delete everything
+			plex.CleanupSourceDir(m.moveSourceDir)
+			m.moveShowCleanup = false
+			m.moveComplete = true
+			m.moveError = "✓ Moved and cleaned up"
+			m.moveShimmerPos = 0
+			return m, m.tickMoveShimmer()
+		case "n", "N", "esc":
+			// User declined cleanup - just close
+			m.moveShowCleanup = false
+			m.moveComplete = true
+			m.moveShimmerPos = 0
+			return m, m.tickMoveShimmer()
+		}
 		return m, handled()
 	}
 
@@ -1748,8 +1817,11 @@ func (m Model) tickMoveShimmer() tea.Cmd {
 }
 
 func (m Model) checkQbitStatus() tea.Cmd {
+	client := m.qbitClient
 	return func() tea.Msg {
-		online := m.qbitClient.IsConnected(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		online := client.IsConnected(ctx)
 		return qbitStatusMsg{online: online}
 	}
 }
@@ -1919,7 +1991,7 @@ func (m Model) downloadTorrent() tea.Cmd {
 		}
 
 		err := client.AddMagnet(context.Background(), t.Magnet, savePath)
-		return torrentAddedMsg{name: t.Name, err: err}
+		return torrentAddedMsg{name: t.Name, infohash: ExtractInfohash(t.Magnet), err: err}
 	}
 }
 
@@ -2012,7 +2084,7 @@ func (m Model) overlayModal(base, modal string) string {
 		leftOffset = 0 // Safety bound
 	}
 
-	// Overlay modal lines onto base
+	// Overlay modal lines onto base, preserving background on sides
 	for i, modalLine := range modalLines {
 		baseIdx := topOffset + i
 		if baseIdx >= len(baseLines) {
@@ -2022,12 +2094,127 @@ func (m Model) overlayModal(base, modal string) string {
 			}
 		}
 
-		// Build the line with modal overlaid
-		padding := strings.Repeat(" ", leftOffset)
-		baseLines[baseIdx] = padding + modalLine
+		baseLine := baseLines[baseIdx]
+		baseLineWidth := lipgloss.Width(baseLine)
+		modalLineWidth := lipgloss.Width(modalLine)
+
+		// Build: leftPart (from base) + modal + rightPart (from base)
+		var result strings.Builder
+
+		// Left part: take from base up to leftOffset
+		if baseLineWidth > 0 {
+			result.WriteString(truncateAnsi(baseLine, leftOffset))
+		}
+		// Pad if base line is shorter than leftOffset
+		currentWidth := lipgloss.Width(result.String())
+		if currentWidth < leftOffset {
+			result.WriteString(strings.Repeat(" ", leftOffset-currentWidth))
+		}
+
+		// Modal content
+		result.WriteString(modalLine)
+
+		// Right part: take from base after the modal ends
+		rightStart := leftOffset + modalLineWidth
+		if baseLineWidth > rightStart {
+			result.WriteString(cutAnsiFrom(baseLine, rightStart))
+		}
+
+		baseLines[baseIdx] = result.String()
 	}
 
 	return strings.Join(baseLines, "\n")
+}
+
+// truncateAnsi truncates an ANSI string to a display width, preserving escape codes
+func truncateAnsi(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	var result strings.Builder
+	width := 0
+	inEscape := false
+
+	for _, r := range s {
+		if r == '\x1b' {
+			inEscape = true
+			result.WriteRune(r)
+			continue
+		}
+		if inEscape {
+			result.WriteRune(r)
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+				inEscape = false
+			}
+			continue
+		}
+		charWidth := 1
+		if r > 0x1100 && isWideRune(r) {
+			charWidth = 2
+		}
+		if width+charWidth > maxWidth {
+			break
+		}
+		result.WriteRune(r)
+		width += charWidth
+	}
+	// Reset any active styles to prevent bleeding
+	result.WriteString("\x1b[0m")
+	return result.String()
+}
+
+// cutAnsiFrom returns the portion of an ANSI string starting at display position 'from'
+func cutAnsiFrom(s string, from int) string {
+	if from <= 0 {
+		return s
+	}
+	var result strings.Builder
+	width := 0
+	inEscape := false
+	capturing := false
+
+	for _, r := range s {
+		if r == '\x1b' {
+			inEscape = true
+			if capturing {
+				result.WriteRune(r)
+			}
+			continue
+		}
+		if inEscape {
+			if capturing {
+				result.WriteRune(r)
+			}
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+				inEscape = false
+			}
+			continue
+		}
+		charWidth := 1
+		if r > 0x1100 && isWideRune(r) {
+			charWidth = 2
+		}
+		if width >= from {
+			if !capturing {
+				capturing = true
+			}
+			result.WriteRune(r)
+		}
+		width += charWidth
+	}
+	return result.String()
+}
+
+// isWideRune checks if a rune is typically double-width in terminals
+func isWideRune(r rune) bool {
+	// CJK and other typically wide characters
+	return (r >= 0x1100 && r <= 0x115F) || // Hangul Jamo
+		(r >= 0x2E80 && r <= 0x9FFF) || // CJK
+		(r >= 0xAC00 && r <= 0xD7A3) || // Hangul Syllables
+		(r >= 0xF900 && r <= 0xFAFF) || // CJK Compatibility
+		(r >= 0xFE10 && r <= 0xFE1F) || // Vertical forms
+		(r >= 0xFF00 && r <= 0xFF60) || // Fullwidth forms
+		(r >= 0xFFE0 && r <= 0xFFE6) // Fullwidth symbols
 }
 
 // truncateToWidth truncates a string to fit within a given display width
@@ -2144,6 +2331,20 @@ func (m Model) renderMoveModal() string {
 		// Show live progress bar
 		content.WriteString(m.renderProgressBar())
 		content.WriteString("\n")
+	} else if m.moveShowCleanup {
+		// Show cleanup confirmation with remaining files
+		content.WriteString(styles.VPNConnected.Render("  " + m.moveError))
+		content.WriteString("\n\n")
+		content.WriteString(styles.Title.Render("  Remaining files to delete:"))
+		content.WriteString("\n")
+		maxFiles := 5
+		for i, f := range m.moveRemainingFiles {
+			if i >= maxFiles {
+				content.WriteString(fmt.Sprintf("    ... and %d more\n", len(m.moveRemainingFiles)-maxFiles))
+				break
+			}
+			content.WriteString(fmt.Sprintf("    %s\n", styles.Muted.Render(f)))
+		}
 	} else if m.moveError != "" {
 		// Check if it's a success message (starts with checkmark)
 		if strings.HasPrefix(m.moveError, "✓") {
@@ -2159,20 +2360,25 @@ func (m Model) renderMoveModal() string {
 		content.WriteString(styles.Muted.Render("  [esc]Cancel  [enter]Save"))
 	} else if m.moveInProgress {
 		content.WriteString(styles.Muted.Render("  Please wait..."))
+	} else if m.moveShowCleanup {
+		content.WriteString("\n")
+		content.WriteString(styles.Muted.Render("  Delete these files? "))
+		content.WriteString(styles.HelpKey.Render("[y]"))
+		content.WriteString(styles.Muted.Render("es  "))
+		content.WriteString(styles.HelpKey.Render("[n]"))
+		content.WriteString(styles.Muted.Render("o"))
 	} else if m.moveComplete {
 		content.WriteString(styles.Muted.Render("  [esc] Close"))
 	} else {
 		content.WriteString(styles.Muted.Render("  [tab]Type  [i]Edit  [c]Cleanup  [enter]Move  [esc]Cancel"))
 	}
 
-	rendered := modalStyle.Render(content.String())
-
-	// Apply shimmer effect on successful completion
-	if m.moveShimmerPos >= 0 {
-		rendered = m.applyShimmer(rendered)
+	// Use success green border when complete or showing cleanup
+	if m.moveComplete || m.moveShowCleanup {
+		modalStyle = modalStyle.BorderForeground(lipgloss.Color("#50FA7B"))
 	}
 
-	return rendered
+	return modalStyle.Render(content.String())
 }
 
 // renderProgressBar renders a truecolor gradient progress bar (sunset palette)
@@ -2253,41 +2459,6 @@ func progressGradientColor(pos, total int) string {
 	return fmt.Sprintf("#%02X%02X%02X", int(r), int(g), int(b))
 }
 
-// applyShimmer applies a sweeping shimmer effect across the rendered content.
-// The shimmer brightens characters to a success green color as it passes.
-func (m Model) applyShimmer(content string) string {
-	// Bright success green color
-	shimmerColor := "#50FA7B"
-
-	var result strings.Builder
-	lines := strings.Split(content, "\n")
-
-	// Modal is ~80 chars wide, shimmer sweeps left to right
-	shimmerWidth := 8 // Width of the shimmer band
-	shimmerPos := m.moveShimmerPos
-
-	for lineIdx, line := range lines {
-		runes := []rune(line)
-		for i, r := range runes {
-			// Calculate horizontal position relative to shimmer
-			distFromShimmer := i - shimmerPos
-
-			if distFromShimmer >= 0 && distFromShimmer < shimmerWidth {
-				// Character is within shimmer band - apply green
-				style := lipgloss.NewStyle().Foreground(lipgloss.Color(shimmerColor))
-				result.WriteString(style.Render(string(r)))
-			} else {
-				result.WriteRune(r)
-			}
-		}
-		if lineIdx < len(lines)-1 {
-			result.WriteString("\n")
-		}
-	}
-
-	return result.String()
-}
-
 // renderSettingsModal renders the settings configuration modal
 func (m Model) renderSettingsModal() string {
 	styles := GetStyles()
@@ -2331,7 +2502,7 @@ func (m Model) renderSettingsModal() string {
 	fieldLabels := map[int][]string{
 		0: {"Host", "Port", "Username", "Password"},
 		1: {"Download Path"},
-		2: {"Status Script", "Connect Script"},
+		2: {"Status Script", "Connect Script", "Require VPN (yes/no)"},
 		3: {"Movie Library", "TV Library", "Use Sudo (yes/no)"},
 	}
 
@@ -2501,27 +2672,31 @@ func (m Model) renderTabBar() string {
 	}
 
 	tabs := []struct {
+		num   string
 		name  string
 		tab   tabType
 		count int
 	}{
-		{"[1]Search", tabSearch, len(m.results)},
-		{"[2]Downloads", tabDownloads, len(m.downloading)},
-		{"[3]Completed", tabCompleted, len(m.completed)},
-		{"[4]Sources", tabSources, enabledSources},
+		{"[1]", "Search", tabSearch, len(m.results)},
+		{"[2]", "Downloads", tabDownloads, len(m.downloading)},
+		{"[3]", "Completed", tabCompleted, len(m.completed)},
+		{"[4]", "Sources", tabSources, enabledSources},
 	}
 
 	var parts []string
 	for _, t := range tabs {
+		// Tab number always bright for quick nav scanning
+		num := styles.Title.Render(t.num)
+
 		label := t.name
 		if t.count > 0 {
 			label = fmt.Sprintf("%s(%d)", t.name, t.count)
 		}
 
 		if t.tab == m.activeTab {
-			parts = append(parts, styles.Title.Render(label))
+			parts = append(parts, num+styles.Title.Render(label))
 		} else {
-			parts = append(parts, styles.Muted.Render(label))
+			parts = append(parts, num+styles.Muted.Render(label))
 		}
 	}
 
@@ -3085,8 +3260,12 @@ func (m Model) renderResults(height int) string {
 			PadLeft(fmt.Sprintf("%d", t.Leechers), 6),
 			HealthBar(t.Health(), 6))
 
-		// Check if this item has been downloaded
-		isDownloaded := m.downloaded[t.Name]
+		// Check if this item has been downloaded (by infohash if available)
+		key := ExtractInfohash(t.Magnet)
+		if key == "" {
+			key = t.Name // fallback
+		}
+		isDownloaded := m.downloaded[key]
 
 		if i == m.cursor {
 			if isDownloaded {

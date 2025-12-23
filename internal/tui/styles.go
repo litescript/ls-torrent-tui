@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/litescript/ls-torrent-tui/internal/theme"
@@ -127,4 +129,17 @@ func formatETA(amountLeft int64, dlSpeed int64) string {
 		return fmt.Sprintf("%dd", days) // Just days for very long ETAs
 	}
 	return fmt.Sprintf("%dd%dh", days, hours)
+}
+
+// infohashRegex matches the btih (BitTorrent InfoHash) in a magnet link
+var infohashRegex = regexp.MustCompile(`btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})`)
+
+// ExtractInfohash extracts the infohash from a magnet link.
+// Returns empty string if not found.
+func ExtractInfohash(magnet string) string {
+	matches := infohashRegex.FindStringSubmatch(magnet)
+	if len(matches) >= 2 {
+		return strings.ToLower(matches[1])
+	}
+	return ""
 }

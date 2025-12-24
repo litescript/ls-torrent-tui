@@ -3,7 +3,7 @@ package version
 
 // Version is the current application version.
 // Update this at logical milestones.
-const Version = "0.1.6"
+const Version = "0.1.9"
 
 // Milestones:
 // 0.1.0 - Initial repo setup, scaffolding, CI
@@ -13,5 +13,8 @@ const Version = "0.1.6"
 // 0.1.4 - Fix size parsing, ctrl+u clear, follow torrent feature, SEED/LEECH columns
 // 0.1.5 - Truecolor gradient header
 // 0.1.6 - Native Move to Plex, fixed-size modals, path tab completion
+// 0.1.7 - Improve Move to Plex reliability and UX
+// 0.1.8 - Fix false positive cleanup candidates for single-file torrents
+// 0.1.9 - TV season pack support (multi-episode), dry run mode, dual progress bars
 // 0.2.0 - (planned) Native NordVPN integration
 // 1.0.0 - (planned) Feature-complete public release

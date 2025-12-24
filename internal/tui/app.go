@@ -127,13 +127,17 @@ type Model struct {
 	moveCleanup     bool                 // Whether to delete source after move
 	moveEditing     bool                 // Is user editing the title?
 	moveTitleInput  textinput.Model      // Editable title field
-	moveProgress    float64              // Transfer progress (0.0-1.0)
+	moveProgress    float64              // Transfer progress (0.0-1.0) - overall
 	moveInProgress  bool                 // Is a move operation running?
 	moveError       string               // Error message if move failed
 	moveTotalBytes  int64                // Total bytes to transfer
 	moveCopiedBytes int64                // Bytes copied so far
 	moveRate        string               // Transfer rate (e.g., "10.5MB/s")
 	moveETA         string               // Estimated time remaining (e.g., "0:01:23")
+	moveEpisodeCount   int               // Number of episodes (TV only, 0 for movies)
+	moveCurrentEpisode int               // Current episode being transferred (1-indexed)
+	moveCurrentFile    string            // Name of current file being transferred
+	moveEpisodeProgress float64          // Progress of current episode (0.0-1.0)
 	moveShimmerPos     int                  // Shimmer animation position (-1 = inactive)
 	moveComplete       bool                 // Move finished successfully
 	moveShowCleanup    bool                 // Showing cleanup confirmation?
@@ -425,12 +429,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = fmt.Sprintf("Error: %v", msg.err)
 		} else {
 			m.statusMsg = fmt.Sprintf("Added: %s", TruncateString(msg.name, 40))
-			// Mark as downloaded by infohash (unique identifier)
-			key := msg.infohash
-			if key == "" {
-				key = msg.name // fallback if no infohash
+			// Mark as downloaded by both infohash AND name
+			// (render might not have the magnet yet, so it falls back to name)
+			if msg.infohash != "" {
+				m.downloaded[msg.infohash] = true
 			}
-			m.downloaded[key] = true
+			m.downloaded[msg.name] = true
 		}
 
 	case vpnConnectMsg:
@@ -475,6 +479,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.eta != "" {
 				m.moveETA = msg.eta
 			}
+			// Episode tracking for TV
+			if msg.episodeTotal > 0 {
+				m.moveCurrentEpisode = msg.episodeIndex
+				m.moveEpisodeCount = msg.episodeTotal
+				m.moveEpisodeProgress = msg.episodeProgress
+			}
+			if msg.currentFile != "" {
+				m.moveCurrentFile = msg.currentFile
+			}
 		}
 		// Keep ticking while move is in progress
 		if m.moveInProgress {
@@ -490,7 +503,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.moveSourceDir = msg.result.SourceDir
 			m.moveRemainingFiles = msg.result.RemainingFiles
 
-			// Check if there are remaining files to clean up
 			if m.moveCleanup && len(msg.result.RemainingFiles) > 0 {
 				// Show cleanup confirmation prompt
 				m.moveShowCleanup = true
@@ -1531,8 +1543,17 @@ func (m Model) openMoveModal() (tea.Model, tea.Cmd) {
 		sourcePath = filepath.Join(t.SavePath, t.Name)
 	}
 
-	// Run detection
-	detection, _ := plex.DetectFromPath(sourcePath)
+	// Run detection on the VIDEO FILE, not the folder name.
+	// For season packs, folder is "Show.S03.1080p..." but video is "Show.S03E16.1080p..."
+	// The video filename has the full S##E## pattern needed for accurate detection.
+	var detection plex.DetectionResult
+	if mainVideo, err := plex.FindMainVideo(sourcePath); err == nil {
+		// Detect from the video filename (has S##E## for TV)
+		detection, _ = plex.DetectFromPath(mainVideo)
+	} else {
+		// Fallback to folder detection if no video found
+		detection, _ = plex.DetectFromPath(sourcePath)
+	}
 	if detection.Type == plex.MediaTypeUnknown {
 		// Default to movie if detection failed
 		detection.Type = plex.MediaTypeMovie
@@ -1561,6 +1582,20 @@ func (m Model) openMoveModal() (tea.Model, tea.Cmd) {
 
 	// Find subtitles
 	m.moveSubtitles = plex.FindSubtitles(sourcePath)
+
+	// Find episode count for TV
+	if detection.Type == plex.MediaTypeTV {
+		if videos, err := plex.FindAllVideos(sourcePath); err == nil {
+			m.moveEpisodeCount = len(videos)
+		} else {
+			m.moveEpisodeCount = 1
+		}
+	} else {
+		m.moveEpisodeCount = 0
+	}
+	m.moveCurrentEpisode = 0
+	m.moveCurrentFile = ""
+	m.moveEpisodeProgress = 0
 
 	// Generate destination preview
 	m.updateMoveDestPreview()
@@ -1634,9 +1669,9 @@ func (m Model) handleMoveModalKey(key string) (tea.Model, tea.Cmd) {
 		case "y", "Y":
 			// User confirmed cleanup - delete everything
 			plex.CleanupSourceDir(m.moveSourceDir)
+			m.moveError = "✓ Moved and cleaned up"
 			m.moveShowCleanup = false
 			m.moveComplete = true
-			m.moveError = "✓ Moved and cleaned up"
 			m.moveShimmerPos = 0
 			return m, m.tickMoveShimmer()
 		case "n", "N", "esc":
@@ -1688,11 +1723,15 @@ func (m Model) handleMoveModalKey(key string) (tea.Model, tea.Cmd) {
 
 // Move operation messages
 type moveProgressMsg struct {
-	progress float64
-	copied   int64
-	total    int64
-	rate     string
-	eta      string
+	progress        float64
+	copied          int64
+	total           int64
+	rate            string
+	eta             string
+	episodeIndex    int     // Current episode (1-based), 0 for movies
+	episodeTotal    int     // Total episodes, 0 for movies
+	episodeProgress float64 // Current episode progress
+	currentFile     string  // Current filename
 }
 
 type moveCompleteMsg struct {
@@ -1796,11 +1835,15 @@ func (m Model) tickMoveProgress() tea.Cmd {
 			default:
 				if hasProgress {
 					return moveProgressMsg{
-						progress: lastProgress.Percentage,
-						copied:   lastProgress.BytesCopied,
-						total:    lastProgress.TotalBytes,
-						rate:     lastProgress.Rate,
-						eta:      lastProgress.ETA,
+						progress:        lastProgress.Percentage,
+						copied:          lastProgress.BytesCopied,
+						total:           lastProgress.TotalBytes,
+						rate:            lastProgress.Rate,
+						eta:             lastProgress.ETA,
+						episodeIndex:    lastProgress.EpisodeIndex,
+						episodeTotal:    lastProgress.EpisodeTotal,
+						episodeProgress: lastProgress.EpisodeProgress,
+						currentFile:     lastProgress.CurrentFile,
 					}
 				}
 				// No updates, just tick again
@@ -2297,8 +2340,13 @@ func (m Model) renderMoveModal() string {
 			content.WriteString(fmt.Sprintf("  Year:        %d\n", m.moveDetection.Year))
 		}
 	} else {
-		content.WriteString(fmt.Sprintf("  Season:      %d  Episode: %d\n",
-			m.moveDetection.Season, m.moveDetection.Episode))
+		// Show season and episode info for TV
+		content.WriteString(fmt.Sprintf("  Season:      %d\n", m.moveDetection.Season))
+		if m.moveEpisodeCount > 1 {
+			content.WriteString(fmt.Sprintf("  Episodes:    %d\n", m.moveEpisodeCount))
+		} else {
+			content.WriteString(fmt.Sprintf("  Episode:     %d\n", m.moveDetection.Episode))
+		}
 	}
 
 	content.WriteString("\n")
@@ -2370,7 +2418,7 @@ func (m Model) renderMoveModal() string {
 	} else if m.moveComplete {
 		content.WriteString(styles.Muted.Render("  [esc] Close"))
 	} else {
-		content.WriteString(styles.Muted.Render("  [tab]Type  [i]Edit  [c]Cleanup  [enter]Move  [esc]Cancel"))
+		content.WriteString(styles.Muted.Render("  [tab]Type [i]Edit [c]Cleanup [enter]Move [esc]Cancel"))
 	}
 
 	// Use success green border when complete or showing cleanup
@@ -2382,9 +2430,84 @@ func (m Model) renderMoveModal() string {
 }
 
 // renderProgressBar renders a truecolor gradient progress bar (sunset palette)
+// For TV with multiple episodes, shows dual bars: overall + current episode
 func (m Model) renderProgressBar() string {
-	width := 68 // Full width bar, info goes underneath
-	filled := int(m.moveProgress * float64(width))
+	styles := GetStyles()
+	var result strings.Builder
+	barWidth := 66 // Consistent width for all bars
+
+	// For TV with multiple episodes, show dual progress bars
+	if m.moveEpisodeCount > 1 && m.moveMediaType == plex.MediaTypeTV {
+		// Season label and overall progress bar
+		result.WriteString("  Season\n")
+		result.WriteString(m.renderSingleProgressBar(m.moveProgress, barWidth))
+		result.WriteString("\n")
+
+		// Current file info
+		if m.moveCurrentFile != "" {
+			result.WriteString(fmt.Sprintf("  Episode %d/%d: %s\n",
+				m.moveCurrentEpisode, m.moveEpisodeCount,
+				styles.Muted.Render(TruncateString(m.moveCurrentFile, 50))))
+		} else {
+			result.WriteString(fmt.Sprintf("  Episode %d/%d\n",
+				m.moveCurrentEpisode, m.moveEpisodeCount))
+		}
+
+		// Episode progress bar
+		result.WriteString(m.renderSingleProgressBar(m.moveEpisodeProgress, barWidth))
+
+		// Rate and ETA on last line
+		var info strings.Builder
+		if m.moveRate != "" {
+			info.WriteString(m.moveRate)
+		}
+		if m.moveETA != "" {
+			if info.Len() > 0 {
+				info.WriteString("  •  ")
+			}
+			info.WriteString(fmt.Sprintf("ETA %s", m.moveETA))
+		}
+		if info.Len() > 0 {
+			result.WriteString("\n  ")
+			result.WriteString(info.String())
+		}
+	} else {
+		// Single file (movie or single episode)
+		result.WriteString(m.renderSingleProgressBar(m.moveProgress, barWidth))
+		result.WriteString("\n")
+
+		// Progress info
+		var info strings.Builder
+		if m.moveTotalBytes > 0 {
+			info.WriteString(fmt.Sprintf("  %s / %s",
+				formatSize(m.moveCopiedBytes),
+				formatSize(m.moveTotalBytes)))
+		}
+		if m.moveRate != "" {
+			if info.Len() > 0 {
+				info.WriteString("  •  ")
+			} else {
+				info.WriteString("  ")
+			}
+			info.WriteString(m.moveRate)
+		}
+		if m.moveETA != "" {
+			if info.Len() > 0 {
+				info.WriteString("  •  ")
+			} else {
+				info.WriteString("  ")
+			}
+			info.WriteString(fmt.Sprintf("ETA %s", m.moveETA))
+		}
+		result.WriteString(info.String())
+	}
+
+	return result.String()
+}
+
+// renderSingleProgressBar renders a single progress bar
+func (m Model) renderSingleProgressBar(progress float64, width int) string {
+	filled := int(progress * float64(width))
 	if filled > width {
 		filled = width
 	}
@@ -2392,7 +2515,7 @@ func (m Model) renderProgressBar() string {
 	var bar strings.Builder
 	bar.WriteString("  [")
 
-	// Render filled portion with sunset gradient (dark rust -> golden yellow)
+	// Render filled portion with sunset gradient
 	for i := 0; i < filled; i++ {
 		color := progressGradientColor(i, filled)
 		style := lipgloss.NewStyle().Foreground(lipgloss.Color(color))
@@ -2405,28 +2528,7 @@ func (m Model) renderProgressBar() string {
 		bar.WriteString(emptyStyle.Render("░"))
 	}
 
-	bar.WriteString("]\n")
-
-	// Progress info on second line
-	pct := m.moveProgress * 100
-	var info strings.Builder
-	info.WriteString(fmt.Sprintf("  %5.1f%%", pct))
-
-	if m.moveTotalBytes > 0 {
-		info.WriteString(fmt.Sprintf("  •  %s / %s",
-			formatSize(m.moveCopiedBytes),
-			formatSize(m.moveTotalBytes)))
-	}
-
-	if m.moveRate != "" {
-		info.WriteString(fmt.Sprintf("  •  %s", m.moveRate))
-	}
-
-	if m.moveETA != "" {
-		info.WriteString(fmt.Sprintf("  •  ETA %s", m.moveETA))
-	}
-
-	bar.WriteString(info.String())
+	bar.WriteString(fmt.Sprintf("] %5.1f%%", progress*100))
 
 	return bar.String()
 }
